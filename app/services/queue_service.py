@@ -4,21 +4,19 @@ Queue service — thin ARQ enqueue wrapper.
 The ingest endpoint calls `enqueue_remediation_job` to push a job into
 the Redis-backed ARQ queue. The ARQ worker process (see `app/worker.py`)
 picks it up and runs `process_remediation_job`.
-
-Why this wrapper exists:
-    - Decouples the endpoint from knowing about ARQ internals.
-    - Makes it trivial to mock in tests (patch just this function).
-    - Centralises queue configuration (queue name, job TTL, retry policy).
 """
 import logging
+from typing import Optional
 
 import redis.asyncio as aioredis
-from arq import ArqRedis
+from arq import ArqRedis, create_pool
 from arq.connections import RedisSettings
 
 from app.config import settings
 
 logger = logging.getLogger("aletheia")
+
+_arq_pool: Optional[ArqRedis] = None
 
 
 def get_redis_settings() -> RedisSettings:
@@ -38,6 +36,14 @@ def get_redis_settings() -> RedisSettings:
     )
 
 
+async def get_arq_redis() -> ArqRedis:
+    """Get or create an ARQ Redis pool instance."""
+    global _arq_pool
+    if _arq_pool is None:
+        _arq_pool = await create_pool(get_redis_settings())
+    return _arq_pool
+
+
 async def enqueue_remediation_job(
     redis: aioredis.Redis,
     job_id: str,
@@ -49,18 +55,19 @@ async def enqueue_remediation_job(
     """Enqueue a remediation job into the ARQ Redis queue.
 
     Args:
-        redis:        Active async Redis connection (from `app.state.redis`).
+        redis:        Active async Redis connection (or None).
         job_id:       Pre-generated UUID for the RemediationJob row.
         error_log:    Normalized alert/error log text.
         target_file:  Path hint for the file to patch (empty string if unknown).
         auto_approve: Skip human approval gate if True.
 
     Returns:
-        The ARQ job ID (distinct from the remediation job_id — it's the
-        internal queue message identifier).
+        The remediation job_id.
     """
-    # Create an ARQ-capable Redis client from the existing connection pool.
-    arq_redis = ArqRedis(pool_or_conn=redis)
+    if isinstance(redis, ArqRedis):
+        arq_redis = redis
+    else:
+        arq_redis = await get_arq_redis()
 
     arq_job = await arq_redis.enqueue_job(
         "process_remediation_job",   # Must match function name in WorkerSettings.functions
@@ -73,7 +80,6 @@ async def enqueue_remediation_job(
     )
 
     if arq_job is None:
-        # arq returns None when a job with the same _job_id already exists
         logger.info("Job %s already enqueued (idempotent re-enqueue skipped)", job_id)
     else:
         logger.info("Job %s enqueued to ARQ queue", job_id)

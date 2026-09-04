@@ -91,11 +91,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Use this when you can't afford a second service (e.g., Render free tier).
     if os.getenv("RUN_WORKER_INPROCESS", "").lower() in ("true", "1", "yes"):
         try:
-            from arq import run_worker
+            from arq.worker import create_worker
             from app.worker import WorkerSettings
             logger.info("Starting in-process ARQ worker (RUN_WORKER_INPROCESS=true)")
+            worker = create_worker(WorkerSettings)
             _worker_task = asyncio.create_task(
-                run_worker(WorkerSettings, watch=False),
+                worker.main(),
                 name="arq-inprocess-worker",
             )
         except Exception as exc:

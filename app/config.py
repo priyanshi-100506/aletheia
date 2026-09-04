@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     # ── AI ────────────────────────────────────────────────────────────────────
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_MODEL: str = "gemini-3.6-flash"
 
     # ── GitHub ────────────────────────────────────────────────────────────────
     GITHUB_TOKEN: str = ""

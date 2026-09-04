@@ -163,7 +163,7 @@ async def generate_patch(
             "Configure it in your .env file or deployment secrets."
         )
 
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    model_name = os.getenv("GEMINI_MODEL", settings.GEMINI_MODEL)
 
     # ── Upsert the job record ─────────────────────────────────────────────────
     job: RemediationJob | None = None

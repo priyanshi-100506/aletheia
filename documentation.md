@@ -1,134 +1,120 @@
-# ALETHEIA Technical Documentation
+# ALETHEIA Technical Architecture & System Blueprint
 
-## System Blueprint
+## System Topology
 
-ALETHEIA follows this execution topology:
+ALETHEIA follows this production execution topology:
 
 ```text
-Alert and telemetry sources
-        -> FastAPI ingestion and routing
-        -> HTTP 202 with job_id
-        -> FastAPI background remediation task
-        -> Gemini patch generation
-        -> local Git dry-run validation
-        -> branch, commit, and push
-        -> GitHub REST API pull request
+Monitoring Sources (Datadog / Prometheus / Custom Webhooks)
+        │ HTTP POST /api/v1/webhooks/ingest (HMAC SHA-256 Signature Verification)
+        ▼
+FastAPI Ingestion & Security Gate (Rate Limiting + Idempotency Check)
+        │ HTTP 202 Accepted { status: "processing", job_id: "uuid" }
+        ▼
+FastAPI Background Remediation Worker (Tenacity Exponential Backoff Retries)
+        │ Read Source Code & Prompt -> Gemini 3.6 / 1.5 Flash Structured JSON
+        ▼
+Gemini Patch Generation -> Unified Git Diff (.patch)
+        │ Apply Diff in Isolated Temporary Worktree (git worktree)
+        ▼
+Local Dry-Run Validation (status: DRY_RUN_PASSED)
+        │ Halts Pipeline & Records Audit Event (audit_logs table)
+        ▼
+Human Safety Approval Gate (React Operational UI / POST /api/v1/jobs/{id}/approve)
+        │ Explicit Human Approval Granted
+        ▼
+Git Worktree Commit, Branch Push & GitHub REST API Pull Request Creation
 ```
 
-Supported source categories are generic HTTP payloads, Datadog-style alerts, and Prometheus-style alert groups. PostgreSQL stores the remediation job record, generated diff, execution state, and failure message.
+Supported alert sources are generic HTTP payloads, Datadog-style alerts, and Prometheus-style firing alert groups. PostgreSQL stores remediation job records, unified code diffs, execution state, failure logs, and append-only security audit events.
+
+---
 
 ## Module Tree
 
 ```text
 app/
-    api/v1/endpoints/patch.py       Patch generation and application endpoints
-    api/v1/endpoints/webhooks.py    Alert normalization and ingestion endpoint
+    api/v1/endpoints/approval.py    Server-side approval, rejection, and activity audit endpoints
+    api/v1/endpoints/jobs.py        Authenticated job listing and status lookup endpoints
+    api/v1/endpoints/patch.py       Patch generation and direct dry-run application endpoints
+    api/v1/endpoints/webhooks.py    HMAC-verified, rate-limited alert ingestion endpoint
     api/v1/router.py                v1 route aggregator
-    config.py                       Environment and settings configuration
-    db/database.py                  Async SQLAlchemy engine and sessions
-    models/remediation.py           Remediation ORM model and PatchStatus
-    schemas/webhook.py              Vendor payload normalization
-    services/patcher.py             Gemini patch generation
-    services/git_applier.py         Local unified diff validation/application
-    services/github_service.py      Git push and GitHub PR creation
-    services/orchestrator.py        End-to-end background remediation worker
-    api/v1/endpoints/jobs.py        Authenticated job status endpoint
-    main.py                         FastAPI application and lifecycle
+    config.py                       Environment and security settings configuration
+    core/security.py                Signature verification, rate limiting, and idempotency logic
+    db/database.py                  Async SQLAlchemy engine, AsyncSessionLocal, and init_db
+    models/audit.py                 AuditLog ORM model for security trail
+    models/remediation.py           RemediationJob ORM model and PatchStatus enum
+    schemas/api.py                  Standard API request and response schemas
+    schemas/patch.py                Pydantic PatchResult schema for LLM structured output
+    schemas/webhook.py              Vendor payload normalization rules
+    services/git_applier.py         Local unified diff validation and dry-run application
+    services/github_service.py      Git branch push and GitHub API PR creation
+    services/orchestrator.py        End-to-end background remediation worker with retries
+    services/patcher.py             Gemini patch generation with source code context
+    services/security_service.py    HMAC signature, rate limiter, and idempotency checkers
+    main.py                         FastAPI application, CORS, health, readiness, and lifespan
 ```
 
-## Architecture
+---
 
-The API is mounted in `app/main.py` with the `/api/v1` prefix. The v1 router includes patch endpoints and webhook endpoints. Database access uses `AsyncSessionLocal` from `app/db/database.py`.
+## Data Flow & Pipeline Workflow
 
-The remediation pipeline is implemented in `app/services/orchestrator.py`:
+1. **Ingest & Verify:** The webhook endpoint receives an alert payload, verifies the HMAC SHA-256 signature (`X-Hub-Signature-256`), checks rate limits, and validates `X-Idempotency-Key`.
+2. **Normalize:** `normalize_alert` maps provider-specific telemetry into canonical `(error_log, target_file)`.
+3. **Queue:** A job ID is generated and returned immediately with HTTP `202`.
+4. **Analyze & Fix:** The background worker sets status to `GENERATING`, reads the target file from disk, and invokes Gemini AI to produce structured JSON (`PatchResult`).
+5. **Dry-Run Test:** The patcher executes `git apply --check` inside an isolated temporary Git worktree (`git worktree`). Upon passing, status moves to `DRY_RUN_PASSED` and an `AWAITING_APPROVAL` audit event is logged.
+6. **Human Approval Gate:** An on-call engineer inspects the code diff in the React UI and clicks **Approve & Push PR**.
+7. **PR Creation:** The server verifies authorization via `POST /api/v1/jobs/{job_id}/approve`, creates branch `fix/aletheia-{job_id}`, commits the patch, pushes to GitHub `origin`, and creates a GitHub Pull Request via REST API.
 
-```text
-webhook payload
-    -> normalize_alert
-    -> background task
-    -> generate_patch
-    -> apply_unified_diff(dry_run=True)
-    -> create_pull_request
-```
-
-## Data Flow
-
-1. The webhook normalizes a provider payload into `(error_log, target_file)`.
-2. A job ID is generated and returned immediately with HTTP `202`.
-3. The background task persists the job and moves it through `GENERATING`.
-4. Gemini produces the root-cause description and unified diff.
-5. `git apply --check` validates the diff, with the existing three-way fallback.
-6. Git creates `fix/aletheia-{job_id}`, applies and commits the diff, then pushes it.
-7. GitHub receives `POST /repos/{owner}/{repo}/pulls` and returns the PR URL.
-
-The job lifecycle is `PENDING -> GENERATING -> GENERATED -> DRY_RUN_PASSED -> PR_CREATED`. Any failed pipeline operation attempts to set `FAILED` and stores the error text.
+---
 
 ## Configuration Reference
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `DATABASE_URL` | Async PostgreSQL connection string | Local Docker PostgreSQL URL |
-| `GEMINI_API_KEY` | Gemini authentication | Empty, generation fails |
-| `GITHUB_TOKEN` | GitHub API authentication | Unset, PR creation fails |
-| `GITHUB_REPOSITORY` | GitHub `owner/repository` | Parsed from `origin` |
-| `GITHUB_BASE_BRANCH` | Pull request target branch | `main` |
-| `REPO_PATH` | Local checkout used by the worker | `.` |
+| `DATABASE_URL` | Async PostgreSQL connection string | `postgresql+asyncpg://aletheia_user:aletheia_password@127.0.0.1:5435/aletheia_db` |
+| `GEMINI_API_KEY` | Google Gemini API Authentication Key | Unset |
+| `GITHUB_TOKEN` | GitHub Personal Access Token (PAT) for PR creation | Unset (Falls back to simulation mode) |
+| `GITHUB_REPOSITORY` | Target GitHub repository (`owner/repo`) | `priyanshi-100506/aletheia` |
+| `GITHUB_BASE_BRANCH` | Base target branch for pull requests | `main` |
+| `WEBHOOK_SECRET` | HMAC SHA-256 signing secret for webhooks | Unset |
+| `REPO_PATH` | Local Git repository checkout path | `.` |
 
-## Payload normalization
+---
 
-`GenericAlertPayload` is the canonical internal shape:
+## Security & Protection Architecture
 
-- `error_log: str`
-- `target_file: str | None`
+1. **HMAC Signature Verification:** Prevents unauthorized HTTP webhook requests.
+2. **Rate Limiting & Anti-Spam:** Sliding-window rate limiter prevents DoS attacks on alert ingestion routes.
+3. **Idempotency Keys:** Suppresses duplicate execution of identical alert trace payloads.
+4. **Git Worktree Isolation:** Prevents concurrent remediation tasks from altering the primary working directory or causing race conditions.
+5. **Server-Side Approval Enforcement:** Prevents automated unreviewed AI code pushes to remote repositories.
+6. **Append-Only Audit Trail:** Stores structured security events in the `audit_logs` SQL table.
 
-Payloads containing `alerts` are interpreted as Prometheus-style payloads. Firing alerts are preferred, and descriptions, summaries, or alert names are combined into the error log. Payloads containing `error_log` are treated as generic. Other payloads are interpreted as Datadog-style and use `message`, `body`, `error_log`, or `title` in that order.
+---
 
-The webhook accepts a dictionary body to support multiple provider formats. Provider-specific validation is intentionally lightweight and unknown fields are allowed for Datadog and Prometheus payloads.
+## Frontend Command Center Architecture (Orchid Noir)
 
-## Job state decisions
+The React frontend lives in `frontend/` and starts via `npx vite --host 127.0.0.1 --port 5174`. It implements 5 operational screens:
 
-`PatchStatus` includes the following workflow states:
+1. **Incident Command Center:** Live incident table with filter bar and quick detail drawer.
+2. **Review Queue:** Safety-critical view dedicated to dry-run validated patches.
+3. **Diff Viewer (`DiffViewer.tsx`):** Split/unified code diff viewer with line numbers, copy buttons, patch size risk banners, and approval/rejection modals.
+4. **Repositories View:** Displays active repository connections, worktree isolation status, and diff limits.
+5. **Activity Log:** Real-time audit stream fetched from `GET /api/v1/activity`.
+6. **Settings & Ingest Modal:** Configuration panels and browser alert trigger dialog.
 
-- `PENDING`: Initial persisted state.
-- `GENERATING`: Patch generation has started.
-- `GENERATED`: Gemini returned and the patch was stored.
-- `DRY_RUN_PASSED`: The unified diff validated successfully.
-- `PR_CREATED`: GitHub returned a created pull request.
-- `FAILED`: A pipeline operation failed.
+---
 
-`APPLIED` remains available for the existing direct patch endpoint. The orchestrator does not apply changes directly to the working tree after dry-run; it creates a branch and applies the patch as part of PR creation.
+## Multi-Container Docker Deployment
 
-## GitHub decisions
+The system is fully containerized using Docker & Docker Compose:
 
-The Git service uses Git CLI because the repository checkout, patch application, commit, and push are local operations. The branch is normalized to `fix/aletheia-{job_id}`. The commit message is fixed as `fix(autofix): resolve incident`.
+```bash
+docker compose up --build
+```
 
-The GitHub API repository is taken from `GITHUB_REPOSITORY` when supplied. Otherwise, the service parses the `origin` remote. The pull request base branch is `GITHUB_BASE_BRANCH` or `main`. The result includes `pr_url`, `url`, `number`, and the raw API response.
-
-## Failure handling
-
-Database status updates are best effort. A failed lookup, commit, or rollback is logged and does not mask the primary remediation operation. Pipeline failures are recorded as `FAILED` when the job record can be updated, then returned by the background task as a failure result.
-
-The current API returns immediately from webhook ingestion. FastAPI `BackgroundTasks` are process-local and are suitable for the current minimal implementation, but a durable queue is recommended when retries, persistence across restarts, or parallel worker scaling are required.
-
-`/health` is a liveness check. `/ready` performs a lightweight database check and returns `503` when the service cannot use PostgreSQL. Mutation and job routes require `X-API-Key` when `API_KEY` is configured or when the environment is not development.
-
-## Verification status
-
-The application compiles successfully with `uv run python -m compileall -q app`. Route registration and generic, Datadog-style, and Prometheus-style normalization were verified, and `uv run pytest -q tests/test_webhook.py` passes four isolated webhook and orchestrator tests. The frontend passes TypeScript compilation, Vite production build, and Oxlint. Git and GitHub operations have not been exercised against a live remote in this workspace.
-
-## Implementation Checklist
-
-- [x] FastAPI route mounting for patch and webhook workflows.
-- [x] Graceful database fallback and best-effort status updates.
-- [x] Gemini-based unified diff generation.
-- [x] Git strict check and three-way fallback.
-- [x] Multi-vendor telemetry normalization.
-- [x] GitHub branch, push, and pull request automation.
-- [x] Background orchestration through FastAPI `BackgroundTasks`.
-- [ ] Durable queue, retries, and broader integration tests.
-
-## Frontend Integration
-
-The React frontend lives in `frontend/` and starts with `npm run dev -- --host 127.0.0.1 --port 5174`. By default it connects to `http://127.0.0.1:8001/api/v1`, reads `GET /api/v1/jobs?limit=50`, and maps `PENDING`, `GENERATING`, `GENERATED`, `DRY_RUN_PASSED`, `PR_CREATED`, and `FAILED` into the command-center status labels. It polls the collection every 30 seconds and uses the existing demo incidents only when the backend cannot be reached.
-
-Set `VITE_API_BASE_URL` to override the default `http://127.0.0.1:8000/api/v1`. The frontend deliberately does not accept `VITE_API_KEY`, because a Vite environment value becomes browser-visible. Production authentication should use a secure session cookie through a same-origin frontend or a backend-for-frontend proxy. The backend allows the Vite origins through `FRONTEND_ORIGINS`.
+- **PostgreSQL 16 + pgvector:** Database service exposed on port `5435`.
+- **FastAPI Backend (`Dockerfile.backend`):** Python 3.13 backend service on port `8001`.
+- **React Frontend (`Dockerfile.frontend`):** Nginx-served single-page app on port `5174`.

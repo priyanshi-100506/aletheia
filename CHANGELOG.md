@@ -14,82 +14,58 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `app/worker.py` — `WorkerSettings` class; run with `arq app.worker.WorkerSettings`
 - `Dockerfile.worker` — dedicated ARQ worker container image
 - Redis service added to `docker-compose.yml` with persistence (`appendonly yes`) and `maxmemory-policy allkeys-lru`
+- In-process ARQ worker option (`RUN_WORKER_INPROCESS=true`) in `app/main.py` for $0 free-tier single-instance deployment on Render
 
-**Redis-backed security primitives**
-- `app/services/redis_store.py` — Redis sliding-window rate limiter and atomic idempotency store, replacing in-memory dicts that were lost on restart and not shared across processes
+**Security & Hardening**
+- `app/services/patcher.py`: Added `_safe_read_target_file()` enforcing `Path.is_relative_to(repo_root)` and blocking sensitive files (`.env`, `id_rsa`, `*.pem`, `*.key`) from prompt context.
+- `app/services/patcher.py`: Wrapped raw error logs and file context in strict XML tags (`<error_log>`, `<target_file>`) to eliminate prompt delimiter confusion.
+- `app/api/v1/endpoints/patch.py`: Direct live modification locked down (`POST /patch/apply` with `dry_run=False` returns `403 Forbidden`). All live mutations strictly require the human approval workflow.
+- `app/services/github_service.py` & `app/api/v1/endpoints/approval.py`: Added `_sanitize_output()` to redact Personal Access Tokens, GitHub tokens, and auth remote URLs from git errors, audit logs, and HTTP error responses.
+- `app/services/orchestrator.py`: Added TOCTOU pre-approval dry-run verification against repository `HEAD` before opening PR branches.
+- `app/services/redis_store.py`: Redis sliding-window rate limiter and atomic idempotency store, replacing in-memory dicts.
 
-**Infrastructure**
-- `app/models/audit.py` + `app/models/remediation.py` now use `datetime.now(timezone.utc)` (fixes Python 3.12+ deprecation of `datetime.utcnow`)
-- `WAIT_FOR_APPROVAL` status added to `PatchStatus` enum (previously the state was undocumented)
-- `app/db/database.py` — connection pool tuned (`pool_size=10`, `max_overflow=20`, `pool_pre_ping=True`)
-- `.env.example` — complete documented template for all environment variables
-- `.dockerignore` — excludes `.venv`, `node_modules`, `.git`, `*.md`, `*.pyc`
-- `Dockerfile.backend` rewritten to use `uv` and run as non-root `aletheia` user
+**Cloud Deployment & Infrastructure**
+- `DEPLOY.md` — Step-by-step 100% Free-Tier Cloud Deployment Guide for Render (FastAPI + Worker), Neon (PostgreSQL), Upstash (Redis), and Vercel (React Frontend).
+- `render.yaml` — Render Infrastructure-as-Code Blueprint.
+- `frontend/vercel.json` — Vercel SPA rewrite and caching configuration.
+- `app/db/database.py` — Auto-normalizes Neon connection strings (`sslmode=require` → `ssl=require`).
+- `.gitignore` — Full protection for `.env`, `.venv`, `node_modules`, and cache directories.
+- `.env.example` — Documented environment variables template.
 
 **Documentation**
-- `documentation.md` — complete v1 technical reference (12 sections, every module documented)
-- `README.md` — rewritten with Docker quick-start, local dev guide, project structure
-- `CHANGELOG.md` — this file
+- `documentation.md` — Complete v1 technical reference (12 sections, every module documented).
+- `README.md` — Architecture flow diagram, Docker quick-start, local dev guide, free-tier deployment, and webhook examples.
+- `learnings.md` — Complete technical learning guide with first-principles breakdown and interview talking points.
+- `handover.md` — Complete architecture handover reference.
 
 ### Changed
 
 **Orchestrator (`app/services/orchestrator.py`)**
-- Each pipeline stage now opens and closes its own `AsyncSessionLocal()` session — eliminates session leaks on long-running AI/git operations
-- `ctx: dict` parameter added as first argument (ARQ calling convention)
-- Removed `asyncio.sleep(2**attempt)` backoff — ARQ's built-in retry handles this
-- Removed in-process `asyncio.Semaphore` — ARQ `max_jobs` controls concurrency
-- `_create_pr_for_job()` extracted as shared function for auto-approve and human-approval flows
+- Each pipeline stage opens and closes its own `AsyncSessionLocal()` session — eliminates session leaks on long-running AI/git operations.
+- `ctx: dict` parameter added as first argument (ARQ calling convention).
+- Concurrency managed via ARQ `max_jobs`.
+- `_create_pr_for_job()` extracted as shared function for auto-approve and human-approval flows.
 
 **Patcher (`app/services/patcher.py`)**
-- Removed "standalone mode" (silent DB error swallowing) — database is always required
-- Clean error path: on Gemini failure, job status is set to FAILED before re-raising
-- `GEMINI_MODEL` env var respected (was hardcoded to `gemini-3.6-flash`)
+- Removed "standalone mode" (silent DB error swallowing) — database is always required.
+- On Gemini failure, job status is set to `FAILED` before re-raising.
+- `GEMINI_MODEL` defaults to `gemini-2.0-flash`.
 
 **Webhooks endpoint (`app/api/v1/endpoints/webhooks.py`)**
-- Replaced `BackgroundTasks.add_task(process_remediation_job, ...)` with `enqueue_remediation_job(redis, ...)` (ARQ queue)
-- Pre-creates `RemediationJob` row in PostgreSQL before enqueue, so `GET /jobs/{id}` works immediately
-- Rate limiting and idempotency now use async Redis calls
+- Replaced `BackgroundTasks` with `enqueue_remediation_job(redis, ...)` (ARQ queue).
+- Pre-creates `RemediationJob` row in PostgreSQL before enqueue, so `GET /jobs/{id}` works immediately.
+- Rate limiting and idempotency use async Redis calls.
 
 **Approval endpoint (`app/api/v1/endpoints/approval.py`)**
-- Replaced raw `AsyncSessionLocal()` usage with `Depends(get_db)` injection
-- `list_activity` uses injected session instead of manual context manager
+- Uses `Depends(get_db)` injection.
+- Re-verifies dry-run status and redacts tokens from all error outputs.
 
-**Jobs endpoint (`app/api/v1/endpoints/jobs.py`)**
-- `_serialize_job()` serializes datetimes to ISO 8601 strings (previously returned raw datetime objects that could fail JSON serialization in edge cases)
-- Enum values serialized via `.value` to return plain strings
+### Removed
 
-**main.py**
-- Fail-fast in `ENVIRONMENT=production` if Redis or PostgreSQL is unreachable at startup (`sys.exit(1)`)
-- Development mode logs a warning and continues, so you can develop without infrastructure
-- `app.state.redis` set during startup for use by all endpoints
-- Structured logging format configured globally
-
-**docker-compose.yml**
-- Added `redis` service (Redis 7 Alpine, persistent volume, health check)
-- Added `worker` service (ARQ worker with same environment as backend)
-- `backend` depends on both `postgres` (healthy) and `redis` (healthy)
-- `worker` depends on both `postgres` (healthy) and `redis` (healthy)
-- All services use `restart: unless-stopped`
-
-### Fixed
-
-- `datetime.utcnow()` deprecation in `RemediationJob` and `AuditLog` models
-- Session leaks in `orchestrator.py` — sessions held across Gemini API calls (30-600s) were blocking connection pool slots
-- In-memory rate limiter and idempotency store lost on every process restart
-- `approval.py` used `AsyncSessionLocal()` directly instead of the session injected via `Depends(get_db)`, creating an extra unmanaged session per request
-- `jobs.py` returned raw datetime objects from ORM — not always JSON-serializable
-- `docker-compose.yml` missing Redis and worker services
-- `Dockerfile.backend` used `requirements.txt` instead of `pyproject.toml`/`uv`
+- Deleted obsolete `app/services/rag.py` and `app/models/document.py` to eliminate code drift.
 
 ### Tests
 
-- **12 tests** (up from 7), all passing
-- `conftest.py` rebuilt with proper `patch()` targets in the module namespace where functions were imported
-- `test_security_webhooks.py` — 5 tests covering health, ingest, Prometheus format, valid/invalid HMAC
-- `test_webhook.py` — 7 tests covering normalization (3 formats) and orchestrator (4 code paths: happy-path, awaiting approval, generate failure, dry-run failure)
-- Tests run in < 4 seconds with no live infrastructure required
-
-### Breaking Changes
-
-- Webhook ingest now requires Redis to be running (previously used FastAPI `BackgroundTasks` with no external dependency)
-- `process_remediation_job` signature changed: first argument is now `ctx: dict` (ARQ worker context) — direct calls must pass `{}` as first argument
+- **16 tests**, 100% passing.
+- `test_security_webhooks.py` — Health, ingest, Prometheus normalization, HMAC signatures, path traversal blocking, sensitive file filtering, token scrubbing, and /patch/apply direct mutation lockdown.
+- `test_webhook.py` — Alert normalization (Generic, Prometheus, Datadog), orchestrator pipeline execution, auto-approve workflows, AI failure recovery, and dry-run validation error handling.

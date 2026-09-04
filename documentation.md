@@ -284,11 +284,11 @@ All endpoints are under `/api/v1`. All require `X-API-Key` header unless `ENVIRO
 | POST | `/jobs/{job_id}/reject` | Reject patch → mark FAILED |
 | GET | `/activity` | Audit log stream (`?limit=50`) |
 
-### Patch (direct, bypasses queue)
+### Patch (dry-run & sync generation)
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/patch/generate` | Generate patch synchronously |
-| POST | `/patch/apply` | Apply patch directly |
+| POST | `/patch/apply` | Validate patch diff (`dry_run=true` only; `dry_run=false` returns 403) |
 
 ### Health
 | Method | Path | Description |
@@ -302,7 +302,7 @@ All endpoints are under `/api/v1`. All require `X-API-Key` header unless `ENVIRO
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DATABASE_URL` | Yes | postgres@localhost:5435 | Async PostgreSQL connection string |
+| `DATABASE_URL` | Yes | postgres@localhost:5435 | Async PostgreSQL connection string (Neon compatible) |
 | `GEMINI_API_KEY` | Yes | — | Google AI Studio API key |
 | `GEMINI_MODEL` | No | `gemini-2.0-flash` | Model name override |
 | `GITHUB_TOKEN` | No* | — | PAT for PR creation (* required for real PRs) |
@@ -311,13 +311,14 @@ All endpoints are under `/api/v1`. All require `X-API-Key` header unless `ENVIRO
 | `REPO_PATH` | No | `.` | Absolute path to local git checkout |
 | `API_KEY` | No* | — | API key for endpoint auth (* required in production) |
 | `WEBHOOK_SECRET` | No* | — | HMAC secret for webhook validation |
-| `REDIS_URL` | Yes | redis://localhost:6379/0 | Redis connection URL |
+| `REDIS_URL` | Yes | redis://localhost:6379/0 | Redis connection URL (Upstash compatible) |
 | `WORKER_CONCURRENCY` | No | `4` | ARQ concurrent jobs per worker |
 | `REDIS_JOB_TTL` | No | `86400` | Seconds before job expires from queue |
 | `RATE_LIMIT_MAX_REQUESTS` | No | `30` | Max webhook requests per IP per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | No | `60` | Rate limit sliding window size |
 | `IDEMPOTENCY_TTL_SECONDS` | No | `3600` | Idempotency key dedup window |
 | `MAX_PATCH_LENGTH` | No | `500000` | Maximum allowed patch size in bytes |
+| `RUN_WORKER_INPROCESS` | No | `false` | Run ARQ worker inside FastAPI lifespan (for Render free tier) |
 | `ENVIRONMENT` | No | `development` | `development` or `production` |
 | `FRONTEND_ORIGINS` | No | localhost:5174 | Comma-separated CORS allowed origins |
 
@@ -334,22 +335,25 @@ Sliding-window rate limiter per client IP using Redis sorted sets. Default: 30 r
 ### 3. Idempotency Deduplication
 `X-Idempotency-Key` header deduplication using Redis `SET NX EX`. Prevents the same alert from triggering multiple parallel remediation jobs. Returns HTTP 409 on duplicate.
 
-### 4. API Key Authentication
-All endpoints require `X-API-Key` header matching `settings.API_KEY`. In development mode (`ENVIRONMENT=development`) with no key configured, auth is bypassed for convenience.
+### 4. Path Traversal & Sensitive File Filtering (`_safe_read_target_file`)
+Target file paths in alert payloads are verified with `Path.is_relative_to(repo_root)`. Traversal attacks (`../../etc/passwd`) and sensitive files (`.env`, `.env.*`, `id_rsa`, `*.pem`, `*.key`) are strictly blocked from being read into LLM prompts.
 
-### 5. Git Worktree Isolation
+### 5. Prompt Delimitation & Injection Protection
+All error logs and file context are encapsulated in strict XML tags (`<error_log>`, `<target_file>`) to prevent prompt confusion or injection attacks.
+
+### 6. Strict Direct Apply Lockdown
+`POST /api/v1/patch/apply` prohibits direct live modification (`dry_run=False` returns `403 Forbidden`). All live mutations are strictly constrained to the approval-gated PR workflow.
+
+### 7. Credential & PAT Scrubbing
+All git errors and GitHub API exception strings pass through `_sanitize_output()`, which redacts Personal Access Tokens, Bearer headers, and authenticated remote URLs before writing to audit logs or returning HTTP responses.
+
+### 8. TOCTOU Race Condition Prevention
+Before creating PR branches upon human approval, `approve_and_create_pr()` performs a dry-run re-verification against current repository `HEAD`. If the codebase has diverged since generation, the job fails gracefully rather than applying a conflicting patch.
+
+### 9. Git Worktree Isolation
 All patch application (dry-run and real) happens in a temporary `git worktree` — a separate directory linked to the same repo object. The primary working directory is never modified. Worktrees are always cleaned up in a `finally` block.
 
-### 6. Patch Path Validation
-`_validate_diff_paths()` rejects any patch containing absolute file paths or `../` traversal sequences before running `git apply`.
-
-### 7. Repository Path Boundary
-`_repository_path()` resolves the target repo path and verifies it's within `REPO_PATH`. Prevents the API from applying patches to arbitrary filesystem locations.
-
-### 8. Server-Side Approval Gate
-The PR creation code lives on the server. The React UI calls `POST /jobs/{id}/approve`. There is no way to create a PR by manipulating the frontend — the server re-validates the job state before taking action.
-
-### 9. Append-Only Audit Trail
+### 10. Append-Only Audit Trail
 `audit_logs` table is written to but never updated or deleted. Every security event, approval, and rejection is permanently recorded with timestamp, actor, and structured details.
 
 ---
@@ -450,11 +454,11 @@ uv run pytest tests/ -v
 
 Tests do NOT require live PostgreSQL or Redis. All external I/O is mocked via `tests/conftest.py`.
 
-### Test Coverage by File
+### Test Coverage by File (16/16 Passing)
 | Test file | What it covers |
 |-----------|---------------|
-| `test_security_webhooks.py` | Health probe, 202 acceptance, Prometheus payload, HMAC valid/invalid |
-| `test_webhook.py` | Alert normalization (3 formats), orchestrator pipeline (4 code paths) |
+| `test_security_webhooks.py` | Health probe, 202 acceptance, Prometheus payloads, HMAC valid/invalid verification, path traversal blocking, sensitive file blocking, token scrubbing, and /patch/apply direct mutation denial (403). |
+| `test_webhook.py` | Alert normalization (Generic, Prometheus, Datadog), orchestrator pipeline execution, auto-approve workflows, AI generation failure recovery, and dry-run validation error handling. |
 
 ### Adding a New Service
 

@@ -1,120 +1,484 @@
-# ALETHEIA Technical Architecture & System Blueprint
+# ALETHEIA — Technical Architecture & v1 Reference
 
-## System Topology
+> **Version:** 1.0.0 — v1 Freeze  
+> **Status:** Production-ready  
+> Last updated: 2026-09-04
 
-ALETHEIA follows this production execution topology:
+---
 
-```text
-Monitoring Sources (Datadog / Prometheus / Custom Webhooks)
-        │ HTTP POST /api/v1/webhooks/ingest (HMAC SHA-256 Signature Verification)
+## Table of Contents
+
+1. [What ALETHEIA Does](#1-what-aletheia-does)
+2. [System Topology](#2-system-topology)
+3. [Queue Architecture (Redis + ARQ)](#3-queue-architecture-redis--arq)
+4. [Module Reference](#4-module-reference)
+5. [Data Model](#5-data-model)
+6. [API Reference](#6-api-reference)
+7. [Configuration Reference](#7-configuration-reference)
+8. [Security Architecture](#8-security-architecture)
+9. [Frontend Architecture](#9-frontend-architecture)
+10. [Deployment Guide](#10-deployment-guide)
+11. [Development Guide](#11-development-guide)
+12. [Decision Log](#12-decision-log)
+
+---
+
+## 1. What ALETHEIA Does
+
+ALETHEIA is an autonomous AIOps platform. When your monitoring system fires an alert, ALETHEIA:
+
+1. **Receives** the alert via a secure HTTP webhook
+2. **Analyzes** the error log using Google Gemini AI with the actual source file as context
+3. **Generates** a unified diff patch to fix the root cause
+4. **Validates** the patch with `git apply --check` in an isolated temporary Git worktree
+5. **Presents** the diff to an on-call engineer in the React UI for review
+6. **Creates** a GitHub Pull Request after explicit human approval
+
+No code is pushed without a human approving the diff. This is by design.
+
+---
+
+## 2. System Topology
+
+```
+External Monitoring (Datadog / Prometheus / Custom HTTP)
+        │
+        │ POST /api/v1/webhooks/ingest
+        │ Headers: X-Hub-Signature-256, X-Idempotency-Key, X-API-Key
         ▼
-FastAPI Ingestion & Security Gate (Rate Limiting + Idempotency Check)
-        │ HTTP 202 Accepted { status: "processing", job_id: "uuid" }
+┌─────────────────────────────────────────────┐
+│  FastAPI API Server (port 8001)             │
+│                                             │
+│  1. Verify HMAC-SHA256 signature            │
+│  2. Check Redis rate limit (30 req/min/IP)  │
+│  3. Check Redis idempotency key (1h dedup)  │
+│  4. Normalize alert payload                 │
+│  5. Pre-create RemediationJob row in PG     │
+│  6. Enqueue job_id → Redis (ARQ queue)      │
+│  7. Return HTTP 202 { job_id }              │
+└─────────────────────────────────────────────┘
+        │
+        │ Redis Queue (arq:queue)
         ▼
-FastAPI Background Remediation Worker (Tenacity Exponential Backoff Retries)
-        │ Read Source Code & Prompt -> Gemini 3.6 / 1.5 Flash Structured JSON
+┌─────────────────────────────────────────────┐
+│  ARQ Worker Process                         │
+│                                             │
+│  Stage 1: generate_patch()                  │
+│    - Read target file from disk             │
+│    - Call Gemini API (tenacity retry 4x)    │
+│    - Store PatchResult in PostgreSQL        │
+│    → Status: GENERATING → GENERATED        │
+│                                             │
+│  Stage 2: apply_unified_diff(dry_run=True)  │
+│    - Run git apply --check in temp worktree │
+│    → Status: DRY_RUN_PASSED                │
+│                                             │
+│  Stage 3: Await human approval              │
+│    → Status: WAIT_FOR_APPROVAL             │
+└─────────────────────────────────────────────┘
+        │
+        │ Engineer reviews diff in React UI
+        │ POST /api/v1/jobs/{id}/approve
         ▼
-Gemini Patch Generation -> Unified Git Diff (.patch)
-        │ Apply Diff in Isolated Temporary Worktree (git worktree)
-        ▼
-Local Dry-Run Validation (status: DRY_RUN_PASSED)
-        │ Halts Pipeline & Records Audit Event (audit_logs table)
-        ▼
-Human Safety Approval Gate (React Operational UI / POST /api/v1/jobs/{id}/approve)
-        │ Explicit Human Approval Granted
-        ▼
-Git Worktree Commit, Branch Push & GitHub REST API Pull Request Creation
+┌─────────────────────────────────────────────┐
+│  approve_and_create_pr()                    │
+│                                             │
+│  - Create git worktree at HEAD              │
+│  - Apply patch to worktree                  │
+│  - Commit: "fix(autofix): resolve {id}"     │
+│  - Push branch: fix/aletheia-{job_id}       │
+│  - POST https://api.github.com/repos/.../   │
+│    pulls → GitHub Pull Request              │
+│  → Status: PR_CREATED                      │
+└─────────────────────────────────────────────┘
 ```
 
-Supported alert sources are generic HTTP payloads, Datadog-style alerts, and Prometheus-style firing alert groups. PostgreSQL stores remediation job records, unified code diffs, execution state, failure logs, and append-only security audit events.
-
 ---
 
-## Module Tree
+## 3. Queue Architecture (Redis + ARQ)
 
-```text
-app/
-    api/v1/endpoints/approval.py    Server-side approval, rejection, and activity audit endpoints
-    api/v1/endpoints/jobs.py        Authenticated job listing and status lookup endpoints
-    api/v1/endpoints/patch.py       Patch generation and direct dry-run application endpoints
-    api/v1/endpoints/webhooks.py    HMAC-verified, rate-limited alert ingestion endpoint
-    api/v1/router.py                v1 route aggregator
-    config.py                       Environment and security settings configuration
-    core/security.py                Signature verification, rate limiting, and idempotency logic
-    db/database.py                  Async SQLAlchemy engine, AsyncSessionLocal, and init_db
-    models/audit.py                 AuditLog ORM model for security trail
-    models/remediation.py           RemediationJob ORM model and PatchStatus enum
-    schemas/api.py                  Standard API request and response schemas
-    schemas/patch.py                Pydantic PatchResult schema for LLM structured output
-    schemas/webhook.py              Vendor payload normalization rules
-    services/git_applier.py         Local unified diff validation and dry-run application
-    services/github_service.py      Git branch push and GitHub API PR creation
-    services/orchestrator.py        End-to-end background remediation worker with retries
-    services/patcher.py             Gemini patch generation with source code context
-    services/security_service.py    HMAC signature, rate limiter, and idempotency checkers
-    main.py                         FastAPI application, CORS, health, readiness, and lifespan
+### Why ARQ over Celery or RabbitMQ
+
+| Concern | Celery | RabbitMQ | ARQ (chosen) |
+|---------|--------|----------|--------------|
+| Async-native | No (requires `gevent` or `eventlet`) | No | **Yes** — `async def` tasks natively |
+| Dependencies | `celery`, `kombu`, `billiard` | `pika` or `aio-pika` | `arq`, `redis` only |
+| Broker setup | Separate RabbitMQ or Redis config | RabbitMQ server | **Redis** (already required) |
+| Result storage | Redis/DB optional | Needs separate result backend | **Redis** built-in |
+| Retry policy | `max_retries`, `countdown` | DLQ config | **`max_tries`, `retry_sleep`** |
+
+ARQ is async-native. Since every ALETHEIA service function is already `async def`, ARQ integrates with zero adapter code.
+
+### Queue Flow
+
+```
+API Server                    Redis                    ARQ Worker
+    │                           │                           │
+    │──enqueue_job(job_id)──→   │  arq:queue  ─────────→   │
+    │                           │                           │ process_remediation_job(ctx, job_id, ...)
+    │                           │                           │
+    │  GET /jobs/{job_id}  ←─── │ ←── job result stored ───│
 ```
 
----
+### Job Deduplication
 
-## Data Flow & Pipeline Workflow
+Each ARQ job is enqueued with `_job_id=f"arq:{job_id}"`. If the same job_id is enqueued twice (e.g., duplicate webhook), ARQ silently skips the second enqueue — no duplicate work runs.
 
-1. **Ingest & Verify:** The webhook endpoint receives an alert payload, verifies the HMAC SHA-256 signature (`X-Hub-Signature-256`), checks rate limits, and validates `X-Idempotency-Key`.
-2. **Normalize:** `normalize_alert` maps provider-specific telemetry into canonical `(error_log, target_file)`.
-3. **Queue:** A job ID is generated and returned immediately with HTTP `202`.
-4. **Analyze & Fix:** The background worker sets status to `GENERATING`, reads the target file from disk, and invokes Gemini AI to produce structured JSON (`PatchResult`).
-5. **Dry-Run Test:** The patcher executes `git apply --check` inside an isolated temporary Git worktree (`git worktree`). Upon passing, status moves to `DRY_RUN_PASSED` and an `AWAITING_APPROVAL` audit event is logged.
-6. **Human Approval Gate:** An on-call engineer inspects the code diff in the React UI and clicks **Approve & Push PR**.
-7. **PR Creation:** The server verifies authorization via `POST /api/v1/jobs/{job_id}/approve`, creates branch `fix/aletheia-{job_id}`, commits the patch, pushes to GitHub `origin`, and creates a GitHub Pull Request via REST API.
+### Worker Configuration (`app/worker.py` → `WorkerSettings`)
 
----
-
-## Configuration Reference
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `DATABASE_URL` | Async PostgreSQL connection string | `postgresql+asyncpg://aletheia_user:aletheia_password@127.0.0.1:5435/aletheia_db` |
-| `GEMINI_API_KEY` | Google Gemini API Authentication Key | Unset |
-| `GITHUB_TOKEN` | GitHub Personal Access Token (PAT) for PR creation | Unset (Falls back to simulation mode) |
-| `GITHUB_REPOSITORY` | Target GitHub repository (`owner/repo`) | `priyanshi-100506/aletheia` |
-| `GITHUB_BASE_BRANCH` | Base target branch for pull requests | `main` |
-| `WEBHOOK_SECRET` | HMAC SHA-256 signing secret for webhooks | Unset |
-| `REPO_PATH` | Local Git repository checkout path | `.` |
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `max_jobs` | `4` | Concurrent jobs per worker process |
+| `max_tries` | `3` | Total attempts (1 initial + 2 retries) |
+| `job_timeout` | `600s` | Max time for one job execution (10 min) |
+| `keep_result` | `86400s` | How long job result stays in Redis (24h) |
 
 ---
 
-## Security & Protection Architecture
+## 4. Module Reference
 
-1. **HMAC Signature Verification:** Prevents unauthorized HTTP webhook requests.
-2. **Rate Limiting & Anti-Spam:** Sliding-window rate limiter prevents DoS attacks on alert ingestion routes.
-3. **Idempotency Keys:** Suppresses duplicate execution of identical alert trace payloads.
-4. **Git Worktree Isolation:** Prevents concurrent remediation tasks from altering the primary working directory or causing race conditions.
-5. **Server-Side Approval Enforcement:** Prevents automated unreviewed AI code pushes to remote repositories.
-6. **Append-Only Audit Trail:** Stores structured security events in the `audit_logs` SQL table.
+### `app/main.py`
+FastAPI application factory. Manages the `lifespan` context:
+- Connects to Redis on startup via `init_redis_pool()`; stores pool as `app.state.redis`
+- Calls `init_db()` to create PostgreSQL tables if they don't exist
+- In `ENVIRONMENT=production`, calls `sys.exit(1)` if either Redis or PostgreSQL is unreachable
+- Mounts CORS middleware and the v1 API router
 
----
+### `app/config.py`
+Single source of truth for all configuration. Uses `pydantic-settings` to read from environment variables and `.env` file. See [Configuration Reference](#7-configuration-reference) for all variables.
 
-## Frontend Command Center Architecture (Orchid Noir)
+### `app/db/database.py`
+- `engine` — SQLAlchemy async engine with connection pool (`pool_size=10`, `max_overflow=20`, `pool_pre_ping=True`)
+- `AsyncSessionLocal` — async session factory
+- `init_db()` — creates all tables at startup (not a migration tool)
+- `get_db()` — FastAPI dependency yielding an `AsyncSession`
 
-The React frontend lives in `frontend/` and starts via `npx vite --host 127.0.0.1 --port 5174`. It implements 5 operational screens:
+### `app/models/remediation.py`
+`RemediationJob` ORM model. Tracks every remediation attempt from alert receipt through PR creation.
 
-1. **Incident Command Center:** Live incident table with filter bar and quick detail drawer.
-2. **Review Queue:** Safety-critical view dedicated to dry-run validated patches.
-3. **Diff Viewer (`DiffViewer.tsx`):** Split/unified code diff viewer with line numbers, copy buttons, patch size risk banners, and approval/rejection modals.
-4. **Repositories View:** Displays active repository connections, worktree isolation status, and diff limits.
-5. **Activity Log:** Real-time audit stream fetched from `GET /api/v1/activity`.
-6. **Settings & Ingest Modal:** Configuration panels and browser alert trigger dialog.
+**PatchStatus enum lifecycle:**
+```
+PENDING → GENERATING → GENERATED → DRY_RUN_PASSED → WAIT_FOR_APPROVAL
+                                                   → PR_CREATED (auto-approve)
+Any state → FAILED (on error)
+PR_CREATED → APPLIED (after merge, set manually or via webhook)
+```
 
----
+### `app/models/audit.py`
+`AuditLog` — append-only audit trail. Never delete rows. One row per significant event. Used by the React Activity Log screen.
 
-## Multi-Container Docker Deployment
+**Standard event_type values:**
+`WEBHOOK_INGESTED`, `PIPELINE_STARTED`, `PATCH_GENERATED`, `DRY_RUN_PASSED`,
+`AWAITING_APPROVAL`, `APPROVAL_GRANTED`, `REJECTED`, `PR_CREATED`, `PIPELINE_FAILED`
 
-The system is fully containerized using Docker & Docker Compose:
+### `app/schemas/webhook.py`
+Alert payload normalization. Maps 3 provider formats to `GenericAlertPayload(error_log, target_file)`:
+- **Generic:** `{"error_log": "...", "target_file": "..."}` — passed through directly
+- **Prometheus Alertmanager:** extracts `annotations.description` from firing alerts
+- **Datadog:** extracts `message` or `body` field
 
+### `app/schemas/patch.py`
+`PatchResult` — Pydantic model used as Gemini's structured output schema. Contains `file_path`, `bug_description`, `explanation`, `unified_diff`, `confidence_score`.
+
+### `app/services/orchestrator.py`
+The core pipeline. Runs inside the ARQ worker, not inside FastAPI. Key design decisions:
+- **Each stage opens/closes its own DB session** — no session objects are passed between functions, preventing detached-instance errors
+- **`_record_audit()` never raises** — audit logging failures are logged but never interrupt the pipeline
+- **`auto_approve=False` by default** — safety gate; PR creation requires explicit human approval
+
+### `app/services/patcher.py`
+Gemini AI integration. Builds a structured prompt from the error log and source file content, calls `generate_content` with `response_schema=PatchResult` for guaranteed structured JSON output. Uses `tenacity` for retry on transient errors (429, 503, 500).
+
+### `app/services/git_applier.py`
+Git patch validation and application:
+- `sanitize_diff()` — strips markdown code fences, normalizes line endings
+- `_validate_diff_paths()` — rejects patches with absolute paths or `..` traversal
+- `_repository_path()` — ensures repo path is within the configured `REPO_PATH` boundary
+- `apply_unified_diff(dry_run=True)` — runs `git apply --check --recount --ignore-whitespace`
+
+### `app/services/github_service.py`
+Pull request creation:
+1. Creates a temporary Git worktree at `HEAD` (isolates from working directory)
+2. Creates branch `fix/aletheia-{job_id}`
+3. Applies patch with `git apply -`
+4. Commits and pushes to `origin` with embedded PAT in HTTPS URL
+5. Calls `POST https://api.github.com/repos/{owner}/{repo}/pulls`
+6. Cleans up worktree
+
+If `GITHUB_TOKEN` is not set, returns a simulated response for local development.
+
+### `app/services/security_service.py`
+HMAC-SHA256 webhook signature verification. Stateless. Accepts `sha256=<hex>` prefix format (GitHub/Datadog style) or raw hex. Returns `True` if `WEBHOOK_SECRET` is unset (dev mode).
+
+### `app/services/redis_store.py`
+Redis-backed rate limiter and idempotency store. Replaces the previous in-memory dicts which were lost on restart and not shared across processes.
+
+**Rate limiting algorithm:** Sliding-window sorted set. Each request's timestamp is added as a member; old timestamps are pruned on each request. Atomic pipeline to count + add + expire.
+
+**Idempotency:** `SET NX EX` — atomic check-and-set. Returns `True` (fresh) if key was set, `False` (duplicate) if key already existed.
+
+### `app/services/queue_service.py`
+Thin ARQ enqueue wrapper. The ingest endpoint calls `enqueue_remediation_job()` instead of knowing about ARQ internals. Handles `REDIS_URL → RedisSettings` parsing.
+
+### `app/worker.py`
+ARQ `WorkerSettings` class. Entry point for the worker process:
 ```bash
+arq app.worker.WorkerSettings
+```
+
+### `app/security.py`
+`require_api_key` — FastAPI dependency. In development mode with no `API_KEY` set, passes all requests. In production, requires `X-API-Key` header to match `settings.API_KEY`.
+
+---
+
+## 5. Data Model
+
+### `remediation_jobs`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | VARCHAR(36) PK | UUID string |
+| `error_log` | TEXT | Raw alert text |
+| `target_file` | VARCHAR(512) | File path hint |
+| `bug_description` | TEXT | AI-generated description |
+| `explanation` | TEXT | AI-generated fix explanation |
+| `unified_diff` | TEXT | The actual patch |
+| `confidence_score` | FLOAT | 0.0 – 1.0 |
+| `status` | ENUM | PatchStatus lifecycle state |
+| `error_message` | TEXT | Failure reason (if FAILED) |
+| `created_at` | TIMESTAMPTZ | UTC, timezone-aware |
+| `updated_at` | TIMESTAMPTZ | UTC, updated on every write |
+
+### `audit_logs`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | VARCHAR(36) PK | UUID string |
+| `job_id` | VARCHAR(36) | FK to remediation_jobs (not enforced) |
+| `event_type` | VARCHAR(64) | Screaming snake case constant |
+| `actor` | VARCHAR(128) | "system" or engineer username |
+| `details` | JSON | Event-specific payload |
+| `created_at` | TIMESTAMPTZ | UTC, never updated |
+
+---
+
+## 6. API Reference
+
+All endpoints are under `/api/v1`. All require `X-API-Key` header unless `ENVIRONMENT=development` and `API_KEY` is unset.
+
+### Webhooks
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/webhooks/ingest` | Receive alert, enqueue remediation job → 202 |
+
+### Jobs
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/jobs` | List jobs, newest first (`?limit=50`) |
+| GET | `/jobs/{job_id}` | Get single job detail + diff |
+
+### Approval
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/jobs/{job_id}/approve` | Approve patch → create GitHub PR |
+| POST | `/jobs/{job_id}/reject` | Reject patch → mark FAILED |
+| GET | `/activity` | Audit log stream (`?limit=50`) |
+
+### Patch (direct, bypasses queue)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/patch/generate` | Generate patch synchronously |
+| POST | `/patch/apply` | Apply patch directly |
+
+### Health
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Liveness probe → 200 always |
+| GET | `/ready` | Readiness probe → 200 if DB reachable |
+
+---
+
+## 7. Configuration Reference
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DATABASE_URL` | Yes | postgres@localhost:5435 | Async PostgreSQL connection string |
+| `GEMINI_API_KEY` | Yes | — | Google AI Studio API key |
+| `GEMINI_MODEL` | No | `gemini-2.0-flash` | Model name override |
+| `GITHUB_TOKEN` | No* | — | PAT for PR creation (* required for real PRs) |
+| `GITHUB_REPOSITORY` | No | — | `owner/repo` for PR target |
+| `GITHUB_BASE_BRANCH` | No | `main` | Base branch for PRs |
+| `REPO_PATH` | No | `.` | Absolute path to local git checkout |
+| `API_KEY` | No* | — | API key for endpoint auth (* required in production) |
+| `WEBHOOK_SECRET` | No* | — | HMAC secret for webhook validation |
+| `REDIS_URL` | Yes | redis://localhost:6379/0 | Redis connection URL |
+| `WORKER_CONCURRENCY` | No | `4` | ARQ concurrent jobs per worker |
+| `REDIS_JOB_TTL` | No | `86400` | Seconds before job expires from queue |
+| `RATE_LIMIT_MAX_REQUESTS` | No | `30` | Max webhook requests per IP per window |
+| `RATE_LIMIT_WINDOW_SECONDS` | No | `60` | Rate limit sliding window size |
+| `IDEMPOTENCY_TTL_SECONDS` | No | `3600` | Idempotency key dedup window |
+| `MAX_PATCH_LENGTH` | No | `500000` | Maximum allowed patch size in bytes |
+| `ENVIRONMENT` | No | `development` | `development` or `production` |
+| `FRONTEND_ORIGINS` | No | localhost:5174 | Comma-separated CORS allowed origins |
+
+---
+
+## 8. Security Architecture
+
+### 1. HMAC Webhook Signature Verification
+Every inbound webhook is validated against `WEBHOOK_SECRET` using HMAC-SHA256 before any processing occurs. Invalid signatures return HTTP 401. This prevents spoofed alerts from triggering AI-driven code changes.
+
+### 2. Redis Rate Limiting
+Sliding-window rate limiter per client IP using Redis sorted sets. Default: 30 requests per 60-second window. Returns HTTP 429 on excess. Persists across restarts and works correctly with multiple API server replicas.
+
+### 3. Idempotency Deduplication
+`X-Idempotency-Key` header deduplication using Redis `SET NX EX`. Prevents the same alert from triggering multiple parallel remediation jobs. Returns HTTP 409 on duplicate.
+
+### 4. API Key Authentication
+All endpoints require `X-API-Key` header matching `settings.API_KEY`. In development mode (`ENVIRONMENT=development`) with no key configured, auth is bypassed for convenience.
+
+### 5. Git Worktree Isolation
+All patch application (dry-run and real) happens in a temporary `git worktree` — a separate directory linked to the same repo object. The primary working directory is never modified. Worktrees are always cleaned up in a `finally` block.
+
+### 6. Patch Path Validation
+`_validate_diff_paths()` rejects any patch containing absolute file paths or `../` traversal sequences before running `git apply`.
+
+### 7. Repository Path Boundary
+`_repository_path()` resolves the target repo path and verifies it's within `REPO_PATH`. Prevents the API from applying patches to arbitrary filesystem locations.
+
+### 8. Server-Side Approval Gate
+The PR creation code lives on the server. The React UI calls `POST /jobs/{id}/approve`. There is no way to create a PR by manipulating the frontend — the server re-validates the job state before taking action.
+
+### 9. Append-Only Audit Trail
+`audit_logs` table is written to but never updated or deleted. Every security event, approval, and rejection is permanently recorded with timestamp, actor, and structured details.
+
+---
+
+## 9. Frontend Architecture
+
+The React frontend (`frontend/`) is the operational command center for on-call engineers. Built with React + TypeScript + Vite, styled with the **Orchid Noir** design system.
+
+### Screens
+
+| Screen | Component | Purpose |
+|--------|-----------|---------|
+| Incident Command Center | `App.tsx` (main view) | Live job table, status badges, filter bar |
+| Diff Viewer | `DiffViewer.tsx` | Split/unified diff with approve/reject controls |
+| Activity Log | `ActivityLog.tsx` | Real-time audit event stream |
+| Repositories | `Repositories.tsx` | Active repo connections, worktree status |
+| Settings / Ingest | `Settings.tsx`, `AlertIngestModal.tsx` | Config display, manual alert trigger |
+
+### API Client (`api.ts`)
+
+All backend calls go through `api.ts`. The base URL is configurable via `VITE_API_URL` environment variable (defaults to `http://localhost:8001`).
+
+### Development
+```bash
+cd frontend
+npm install
+npm run dev   # starts at http://localhost:5174
+```
+
+---
+
+## 10. Deployment Guide
+
+### Prerequisites
+- Docker & Docker Compose v2+
+- `.env` file (copy from `.env.example` and fill in values)
+
+### One-command startup
+```bash
+cp .env.example .env
+# Edit .env: add GEMINI_API_KEY, GITHUB_TOKEN, API_KEY, WEBHOOK_SECRET
 docker compose up --build
 ```
 
-- **PostgreSQL 16 + pgvector:** Database service exposed on port `5435`.
-- **FastAPI Backend (`Dockerfile.backend`):** Python 3.13 backend service on port `8001`.
-- **React Frontend (`Dockerfile.frontend`):** Nginx-served single-page app on port `5174`.
+This starts 5 services:
+| Service | Port | Role |
+|---------|------|------|
+| `postgres` | 5435 | PostgreSQL 16 + pgvector |
+| `redis` | 6379 | Queue broker + rate limiter |
+| `backend` | 8001 | FastAPI API server |
+| `worker` | — | ARQ remediation pipeline worker |
+| `frontend` | 5174 | React UI (nginx) |
+
+### Service URLs
+- API docs: http://localhost:8001/docs
+- Health: http://localhost:8001/health
+- Readiness: http://localhost:8001/ready
+- Frontend: http://localhost:5174
+
+### Development (local, without Docker)
+
+**Terminal 1 — PostgreSQL + Redis:**
+```bash
+docker compose up postgres redis
+```
+
+**Terminal 2 — FastAPI backend:**
+```bash
+uv run uvicorn app.main:app --reload --port 8001
+```
+
+**Terminal 3 — ARQ worker:**
+```bash
+uv run arq app.worker.WorkerSettings
+```
+
+**Terminal 4 — React frontend:**
+```bash
+cd frontend && npm run dev
+```
+
+### Sending a test webhook
+
+```bash
+curl -X POST http://localhost:8001/api/v1/webhooks/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"error_log": "AttributeError: NoneType has no attribute get", "target_file": "transaction_service.py"}'
+```
+
+---
+
+## 11. Development Guide
+
+### Running Tests
+```bash
+uv run pytest tests/ -v
+```
+
+Tests do NOT require live PostgreSQL or Redis. All external I/O is mocked via `tests/conftest.py`.
+
+### Test Coverage by File
+| Test file | What it covers |
+|-----------|---------------|
+| `test_security_webhooks.py` | Health probe, 202 acceptance, Prometheus payload, HMAC valid/invalid |
+| `test_webhook.py` | Alert normalization (3 formats), orchestrator pipeline (4 code paths) |
+
+### Adding a New Service
+
+1. Create `app/services/my_service.py` with `async def my_function(...):`
+2. Add docstring explaining: what it does, session contract, what it raises
+3. If it needs to run as a background job, add it to `WorkerSettings.functions` in `app/worker.py`
+4. Add tests in `tests/test_my_service.py` with all external calls mocked
+
+### Environment Variables in Tests
+
+`tests/conftest.py` sets `ENVIRONMENT=development` and `API_KEY=""` before any imports. This bypasses API key enforcement. Do not use production credentials in tests.
+
+---
+
+## 12. Decision Log
+
+| Decision | Chosen | Rejected alternatives | Reason |
+|----------|--------|----------------------|--------|
+| Queue | **ARQ + Redis** | Celery, RabbitMQ | ARQ is async-native; our codebase is entirely `async def`; Celery requires sync task bodies or complex workarounds; RabbitMQ adds ops complexity |
+| AI model | **Gemini 2.0 Flash** | GPT-4, Claude | Structured JSON output via `response_schema` is first-class; fast and cheap |
+| Retry library | **tenacity** | Manual retry loop | Declarative, composable, handles exponential backoff cleanly |
+| DB ORM | **SQLAlchemy async** | raw asyncpg, tortoise-orm | Mature ecosystem, typed mapped columns, async-native in v2 |
+| Session pattern | **Per-operation sessions** | Single long-lived session | Avoids connection leaks across long AI/git operations; async context manager ensures cleanup |
+| Rate limiting | **Redis sorted set** | In-memory dict | Survives restarts; shared across replicas; O(log n) sliding window |
+| Patch validation | **git apply --check** | applying to temp copy | Uses the actual git conflict detection algorithm; handles 3-way merge |
+| PR isolation | **git worktree** | temp clone | Same repo object (fast); primary working directory untouched; native git feature |
+| Approval gate | **Server-side endpoint** | Frontend-only | Cannot be bypassed by manipulating the React UI; full audit trail |

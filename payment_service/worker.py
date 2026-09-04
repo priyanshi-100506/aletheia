@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 def calculate_transaction_fee(amount: float, discount_tier: int) -> float:
     # BUG: Can cause ZeroDivisionError if discount_tier is 0
     fee_rate = 0.05

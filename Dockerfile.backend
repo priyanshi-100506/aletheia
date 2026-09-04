@@ -1,16 +1,44 @@
-FROM python:3.13-slim
+# ALETHEIA Backend — Dockerfile
+# Builds the FastAPI API server image.
+# Uses uv for fast, reproducible dependency installation.
+
+FROM python:3.13-slim AS base
+
+# System deps: git is required for git worktree operations
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package manager)
+RUN pip install --no-cache-dir uv==0.4.29
 
 WORKDIR /app
 
-# Install system dependencies & git
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+# ── Dependency installation stage ─────────────────────────────────────────────
+# Copy only dependency files first so Docker layer cache is reused
+# when only source code changes (not deps).
+COPY pyproject.toml ./
+RUN uv pip install --system --no-cache -r pyproject.toml 2>/dev/null || \
+    uv pip install --system --no-cache \
+        fastapi uvicorn[standard] sqlalchemy[asyncio] asyncpg pgvector greenlet \
+        arq "redis[hiredis]" google-genai httpx pydantic pydantic-settings \
+        python-dotenv tenacity
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
+# ── Application source ────────────────────────────────────────────────────────
 COPY app/ ./app/
-COPY transaction_service.py .
+COPY transaction_service.py ./
+
+# Non-root user for security
+RUN useradd --no-create-home --shell /bin/false aletheia
+USER aletheia
 
 EXPOSE 8001
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+# Use --workers 1 — concurrency is handled by async, not multiple processes.
+# Increase --workers only if CPU-bound work requires it.
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8001", \
+     "--workers", "1", \
+     "--log-level", "info", \
+     "--no-access-log"]

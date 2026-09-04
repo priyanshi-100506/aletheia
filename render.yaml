@@ -1,0 +1,73 @@
+# ALETHEIA — Render Deployment Configuration
+# Deploy with: Connect GitHub repo to Render, it reads this file automatically.
+#
+# Free tier strategy:
+#   One web service (750 h/month free) runs both the API server AND the ARQ
+#   worker in-process (RUN_WORKER_INPROCESS=true). This stays within the free
+#   allotment for the full month.
+#
+# External services needed (all have free tiers):
+#   PostgreSQL → Neon (https://neon.tech) — free tier, 0.5 GB
+#   Redis      → Upstash (https://upstash.com) — free tier, 10k req/day
+#
+# Environment variables to set in Render dashboard (marked sync:false):
+#   DATABASE_URL    — from Neon dashboard (postgresql://... format, auto-converted)
+#   REDIS_URL       — from Upstash dashboard (rediss://... format)
+#   GEMINI_API_KEY  — from https://ai.google.dev/
+#   GITHUB_TOKEN    — GitHub PAT with repo + workflow scopes
+#   GITHUB_REPOSITORY — owner/repo
+#   API_KEY         — generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
+#   WEBHOOK_SECRET  — generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
+#   FRONTEND_ORIGINS — your Vercel app URL, e.g. https://aletheia.vercel.app
+
+services:
+  - type: web
+    name: aletheia-backend
+    runtime: python
+    region: oregon
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+
+    # PORT is provided by Render automatically
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    healthCheckPath: /health
+
+    envVars:
+      # ── Required secrets (set in Render dashboard) ──────────────────────────
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPOSITORY
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+
+      # ── Static config (set here, no secrets) ────────────────────────────────
+      - key: ENVIRONMENT
+        value: production
+      - key: GITHUB_BASE_BRANCH
+        value: main
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+
+      # ── In-process worker: runs ARQ inside the web service process ───────────
+      # This avoids needing a second Render service (which would halve free hours).
+      - key: RUN_WORKER_INPROCESS
+        value: "true"
+
+      # ── Python path ──────────────────────────────────────────────────────────
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"

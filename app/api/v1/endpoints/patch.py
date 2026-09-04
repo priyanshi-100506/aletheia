@@ -36,34 +36,53 @@ async def generate_code_patch(
             detail=f"Patch generation failed: {str(e)}"
         )
 
-@router.post("/apply", response_model=ApplyPatchResponse, dependencies=[Depends(require_api_key)])
+@router.post(
+    "/apply",
+    response_model=ApplyPatchResponse,
+    dependencies=[Depends(require_api_key)],
+    summary="Validate a patch diff (dry-run)",
+)
 async def apply_patch(
     payload: ApplyPatchRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
+    """Validate a patch diff using git dry-run.
+
+    Security rule: Direct live disk modification (`dry_run=False`) via this endpoint
+    is prohibited to ensure all live code changes go through the human approval
+    gate and isolated Git worktree PR workflow (`/api/v1/jobs/{id}/approve`).
+    """
+    if not payload.dry_run:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Direct live repository mutation is disabled. "
+                "Use dry_run=true for validation. Live remediation must proceed "
+                "through the approval gate (POST /api/v1/jobs/{id}/approve)."
+            ),
+        )
+
     try:
         result = await apply_unified_diff(
             repo_root=payload.repo_root,
             unified_diff=payload.unified_diff,
-            dry_run=payload.dry_run
+            dry_run=True,
         )
-        
+
         # Safe update of DB status if DB is active
         if payload.job_id:
             try:
                 job = await db.get(RemediationJob, payload.job_id)
                 if job:
-                    job.status = (
-                        PatchStatus.DRY_RUN_PASSED if payload.dry_run else PatchStatus.APPLIED
-                    )
+                    job.status = PatchStatus.DRY_RUN_PASSED
                     await db.commit()
             except Exception as db_err:
-                logger.warning(f"[DB SKIPPED] Unable to update job status: {db_err}")
+                logger.warning("[DB SKIPPED] Unable to update job status: %s", db_err)
 
         return ApplyPatchResponse(
-            status=result["status"], 
-            job_id=payload.job_id, 
-            detail=result["detail"]
+            status=result["status"],
+            job_id=payload.job_id,
+            detail=result["detail"],
         )
     except PatchApplicationError as e:
         if payload.job_id:

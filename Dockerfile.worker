@@ -1,0 +1,31 @@
+# ALETHEIA Worker — Dockerfile
+# Builds the ARQ job worker image.
+# Shares the same base dependencies as Dockerfile.backend but
+# runs `arq app.worker.WorkerSettings` instead of uvicorn.
+
+FROM python:3.13-slim AS base
+
+# System deps: git is required for git worktree / patch operations
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir uv==0.4.29
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+RUN uv pip install --system --no-cache -r pyproject.toml 2>/dev/null || \
+    uv pip install --system --no-cache \
+        fastapi sqlalchemy[asyncio] asyncpg pgvector greenlet \
+        arq "redis[hiredis]" google-genai httpx pydantic pydantic-settings \
+        python-dotenv tenacity
+
+COPY app/ ./app/
+COPY transaction_service.py ./
+
+RUN useradd --no-create-home --shell /bin/false aletheia
+USER aletheia
+
+# ARQ reads WorkerSettings from the module path provided here.
+CMD ["arq", "app.worker.WorkerSettings"]

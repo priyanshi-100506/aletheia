@@ -1,11 +1,23 @@
-# ALETHEIA Full Stack Containerization
-
-version: '3.8'
+# ALETHEIA — Full Stack Docker Compose
+# Starts all 4 services with a single command: docker compose up --build
+#
+# Services:
+#   postgres  — PostgreSQL 16 with pgvector extension
+#   redis     — Redis 7 (queue broker + rate limiter + idempotency store)
+#   backend   — FastAPI API server (uvicorn)
+#   worker    — ARQ job worker (runs the remediation pipeline)
+#   frontend  — React UI (nginx, production build)
+#
+# Quick start:
+#   cp .env.example .env   # fill in GEMINI_API_KEY, GITHUB_TOKEN etc.
+#   docker compose up --build
 
 services:
+  # ── PostgreSQL 16 + pgvector ─────────────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: aletheia_pgvector
+    container_name: aletheia_postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: aletheia_user
       POSTGRES_PASSWORD: aletheia_password
@@ -18,33 +30,96 @@ services:
       test: ["CMD-SHELL", "pg_isready -U aletheia_user -d aletheia_db"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: aletheia_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI backend (API server) ──────────────────────────────────────────
   backend:
     build:
       context: .
       dockerfile: Dockerfile.backend
     container_name: aletheia_backend
+    restart: unless-stopped
     environment:
-      - DATABASE_URL=postgresql+asyncpg://aletheia_user:aletheia_password@postgres:5432/aletheia_db
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - ENVIRONMENT=production
+      DATABASE_URL: postgresql+asyncpg://aletheia_user:aletheia_password@postgres:5432/aletheia_db
+      REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_REPOSITORY: ${GITHUB_REPOSITORY}
+      GITHUB_BASE_BRANCH: ${GITHUB_BASE_BRANCH:-main}
+      REPO_PATH: ${REPO_PATH:-.}
+      API_KEY: ${API_KEY}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:5174}
     ports:
       - "8001:8001"
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ── ARQ worker (remediation pipeline) ────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: aletheia_worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aletheia_user:aletheia_password@postgres:5432/aletheia_db
+      REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_REPOSITORY: ${GITHUB_REPOSITORY}
+      GITHUB_BASE_BRANCH: ${GITHUB_BASE_BRANCH:-main}
+      REPO_PATH: ${REPO_PATH:-.}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── React frontend (nginx) ────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile.frontend
     container_name: aletheia_frontend
+    restart: unless-stopped
     ports:
       - "5174:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   pgdata:
+    driver: local
+  redisdata:
+    driver: local

@@ -35,7 +35,10 @@ async def create_pull_request(
     if len(patch_diff) > settings.MAX_PATCH_LENGTH:
         raise ValueError("Patch exceeds the maximum allowed size")
     remote = await asyncio.to_thread(_git, str(repository_path), "remote", "get-url", "origin")
-    token = settings.GITHUB_TOKEN
+    token = os.getenv("GITHUB_TOKEN", settings.GITHUB_TOKEN)
+    target_repo = os.getenv("GITHUB_REPOSITORY", settings.GITHUB_REPOSITORY)
+    base_branch = os.getenv("GITHUB_BASE_BRANCH", settings.GITHUB_BASE_BRANCH)
+
     if not token:
         logger.warning("[GITHUB PR SIMULATION] GITHUB_TOKEN not set. Simulating PR creation for branch %s", branch)
         return {
@@ -45,7 +48,29 @@ async def create_pull_request(
             "simulated": True
         }
 
-    repository = settings.GITHUB_REPOSITORY or remote
+    # 1. Create worktree, apply patch, commit & push branch to remote
+    with tempfile.TemporaryDirectory(prefix="aletheia-worktree-") as worktree:
+        await asyncio.to_thread(_git, str(repository_path), "worktree", "add", "--detach", worktree, "HEAD")
+        try:
+            await asyncio.to_thread(_git, worktree, "checkout", "-b", branch)
+            await asyncio.to_thread(
+                subprocess.run,
+                ["git", "apply", "-"], input=patch_diff, cwd=worktree,
+                text=True, capture_output=True, check=True, timeout=30
+            )
+            await asyncio.to_thread(_git, worktree, "add", "-A")
+            await asyncio.to_thread(_git, worktree, "commit", "-m", f"fix(autofix): resolve incident {branch_name[:8]}")
+            
+            # Embed PAT into push URL if pushing over HTTPS
+            auth_remote = remote
+            if token and "github.com" in remote:
+                auth_remote = f"https://x-access-token:{token}@github.com/{target_repo or 'priyanshi-100506/aletheia'}.git"
+            
+            await asyncio.to_thread(_git, worktree, "push", auth_remote, f"{branch}:{branch}")
+        finally:
+            await asyncio.to_thread(_git, str(repository_path), "worktree", "remove", "--force", worktree)
+
+    repository = target_repo or remote
     if "://" in repository:
         repository = urlparse(repository).path
     else:
@@ -57,7 +82,7 @@ async def create_pull_request(
         response = await client.post(
             url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-            json={"title": pr_title, "body": pr_body, "head": branch, "base": settings.GITHUB_BASE_BRANCH},
+            json={"title": pr_title, "body": pr_body, "head": branch, "base": base_branch},
         )
         response.raise_for_status()
         data = response.json()

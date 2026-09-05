@@ -26,13 +26,13 @@ router = APIRouter()
 
 class ApprovalPayload(BaseModel):
     """Request body for the approve endpoint."""
-    actor: str = "on_call_engineer"
+    pass
 
 
 class RejectionPayload(BaseModel):
     """Request body for the reject endpoint."""
     reason: str = "Rejected during review"
-    actor: str = "on_call_engineer"
+    pass
 
 
 @router.post(
@@ -52,7 +52,7 @@ async def approve_job(
     Only jobs in DRY_RUN_PASSED or WAIT_FOR_APPROVAL state can be approved.
     """
     try:
-        pr_result = await approve_and_create_pr(job_id, actor=payload.actor)
+        pr_result = await approve_and_create_pr(job_id, actor="authenticated_operator")
         return {"status": "approved", "job_id": job_id, "pull_request": pr_result}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -81,7 +81,7 @@ async def reject_job(
     """
     try:
         return await reject_remediation_job(
-            job_id, actor=payload.actor, reason=payload.reason
+            job_id, actor="authenticated_operator", reason=payload.reason
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

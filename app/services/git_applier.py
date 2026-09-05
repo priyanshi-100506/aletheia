@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import logging
 import asyncio
+import shutil
 from pathlib import Path
 
 from app.config import settings
@@ -28,7 +29,8 @@ def sanitize_diff(raw_diff: str) -> str:
     return cleaned
 
 
-def _validate_diff_paths(diff: str) -> None:
+def _validate_diff_paths(diff: str, allowed_target: str | None = None) -> None:
+    seen_paths: set[str] = set()
     for line in diff.splitlines():
         if not (line.startswith("--- ") or line.startswith("+++ ")):
             continue
@@ -39,12 +41,20 @@ def _validate_diff_paths(diff: str) -> None:
         candidate = Path(path)
         if candidate.is_absolute() or ".." in candidate.parts:
             raise PatchApplicationError("Patch contains an unsafe file path")
+        seen_paths.add(candidate.as_posix())
+
+    if not seen_paths:
+        raise PatchApplicationError("Patch does not contain a file header")
+    if allowed_target:
+        target = Path(allowed_target).as_posix().lstrip("./")
+        if seen_paths != {target}:
+            raise PatchApplicationError("Patch modifies a file outside the requested target")
 
 
-def _repository_path(repo_root: str) -> Path:
+def _repository_path(repo_root: str, allow_external: bool = False) -> Path:
     allowed = Path(settings.REPO_PATH).resolve()
     candidate = Path(repo_root).resolve()
-    if candidate != allowed and not candidate.is_relative_to(allowed):
+    if not allow_external and candidate != allowed and not candidate.is_relative_to(allowed):
         raise PatchApplicationError("Repository path is outside the configured checkout")
     if not candidate.is_dir() or not (candidate / ".git").exists():
         raise PatchApplicationError(f"Repository root is not a Git checkout: {repo_root}")
@@ -53,14 +63,16 @@ def _repository_path(repo_root: str) -> Path:
 async def apply_unified_diff(
     repo_root: str, 
     unified_diff: str, 
-    dry_run: bool = False
+    dry_run: bool = False,
+    allowed_target: str | None = None,
+    _allow_external_repo: bool = False,
 ) -> dict:
-    repo_path = _repository_path(repo_root)
+    repo_path = _repository_path(repo_root, allow_external=_allow_external_repo)
 
     clean_patch = sanitize_diff(unified_diff)
     if len(clean_patch) > settings.MAX_PATCH_LENGTH:
         raise PatchApplicationError("Patch exceeds the maximum allowed size")
-    _validate_diff_paths(clean_patch)
+    _validate_diff_paths(clean_patch, allowed_target=allowed_target)
 
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".patch", delete=False, newline="\n") as patch_file:
         patch_file.write(clean_patch)
@@ -115,3 +127,84 @@ async def apply_unified_diff(
     finally:
         if os.path.exists(patch_path):
             os.remove(patch_path)
+
+
+async def validate_in_isolated_workspace(
+    repo_root: str,
+    unified_diff: str,
+    allowed_target: str | None = None,
+    validation_command: list[str] | None = None,
+) -> dict:
+    """Apply a patch to a temporary checkout and run targeted validation."""
+    source_repo = _repository_path(repo_root)
+    with tempfile.TemporaryDirectory(prefix="aletheia-validation-") as workspace:
+        workspace_path = Path(workspace)
+        shutil.copytree(
+            source_repo,
+            workspace_path,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(".git"),
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["git", "init", "-q"],
+            cwd=str(workspace_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["git", "add", "-A"],
+            cwd=str(workspace_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["git", "-c", "user.name=ALETHEIA", "-c", "user.email=aletheia@example.invalid", "commit", "-qm", "baseline"],
+            cwd=str(workspace_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = await apply_unified_diff(
+            str(workspace_path), unified_diff, dry_run=False, allowed_target=allowed_target,
+            _allow_external_repo=True,
+        )
+        evidence: dict[str, str | int] = {}
+        if validation_command:
+            validation = await asyncio.to_thread(
+                subprocess.run,
+                validation_command,
+                cwd=str(workspace_path),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            evidence = {
+                "command": " ".join(validation_command),
+                "returncode": validation.returncode,
+                "stdout": validation.stdout[-4000:],
+                "stderr": validation.stderr[-4000:],
+            }
+            if validation.returncode:
+                raise PatchApplicationError(
+                    f"Validation command failed: {validation.stderr.strip() or validation.stdout.strip()}"
+                )
+        elif allowed_target and allowed_target.endswith(".py"):
+            syntax = await asyncio.to_thread(
+                subprocess.run,
+                [os.fspath(Path(os.sys.executable)), "-m", "py_compile", allowed_target],
+                cwd=str(workspace_path),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if syntax.returncode:
+                raise PatchApplicationError(f"Targeted syntax validation failed: {syntax.stderr.strip()}")
+            evidence = {"command": f"{os.fspath(Path(os.sys.executable))} -m py_compile {allowed_target}", "returncode": 0}
+        return {**result, "status": "validation_passed", "workspace": "temporary", "evidence": evidence}

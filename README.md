@@ -1,8 +1,10 @@
 # ALETHEIA ⚡
 
-**Autonomous AIOps Platform — AI-Driven Incident Detection & Code Remediation.**
+**ALETHEIA is a constrained incident-to-validated-patch workflow for portfolio demonstrations.**
 
-ALETHEIA listens to incoming production monitoring alerts (Prometheus, Datadog, or Generic JSON), analyzes the root cause with Google Gemini 2.0 Flash, generates an exact patch, validates it with a git conflict dry-run (`git apply --check`), and creates a GitHub Pull Request — with full human-in-the-loop approval or automated remediation.
+It receives a controlled alert, generates a proposed patch, enforces an allowed target-file policy, applies the patch in an isolated temporary workspace, runs targeted validation, waits for human approval, and creates or reuses one GitHub PR. It is not currently a fully autonomous production remediation system.
+
+The normal automated test suite uses deterministic fixtures and makes zero Gemini, GitHub, or external-service calls. Real integrations are opt-in. Without `GITHUB_TOKEN`, the API reports `DEMO MODE - NO REAL PR CREATED`; it does not fabricate a PR URL.
 
 ---
 
@@ -29,8 +31,8 @@ ALETHEIA listens to incoming production monitoring alerts (Prometheus, Datadog, 
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                                   ARQ Worker Pipeline                                  │
 │                                                                                        │
-│  1. Gemini 2.0 Flash ────► 2. Git Dry-Run ────► 3. Human Approval ────► 4. GitHub PR   │
-│     (Generate Diff)          (git apply --check)   (React Diff Viewer)     (Worktree)  │
+│  1. Gemini/fixture patch ─► 2. Isolated apply ─► 3. Targeted tests ─► 4. Approval ─► PR │
+│     (Generate Diff)          (allowed target)      (pytest/checks)      (human)       │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -38,7 +40,7 @@ ALETHEIA listens to incoming production monitoring alerts (Prometheus, Datadog, 
 - **Backend:** Python 3.13, FastAPI, SQLAlchemy 2.0 (Async), PostgreSQL (Neon compatible)
 - **Task Queue:** ARQ (Async Redis Queue) + Redis (Upstash compatible)
 - **AI Engine:** Google Gemini 2.0 Flash (Structured JSON output via `response_schema`)
-- **Git Engine:** Isolated Git Worktrees + Subprocess `git apply --check`
+- **Git Engine:** Temporary isolated checkouts + constrained `git apply` + targeted tests
 - **Frontend:** React 18, TypeScript, Vite, TailwindCSS, Lucide Icons
 
 ---
@@ -95,9 +97,9 @@ npm run dev
 
 ---
 
-## ☁️ 100% Free-Tier Cloud Deployment
+## ☁️ Optional Free-Tier Demonstration Deployment
 
-Deploy ALETHEIA completely free with **$0/month** infrastructure:
+ALETHEIA can be deployed on free-tier infrastructure for demonstration purposes:
 
 | Component | Provider | Setup Summary |
 |-----------|----------|---------------|
@@ -170,7 +172,35 @@ uv run pytest tests/ -v --tb=short
 
 ### Test Coverage Highlights
 - `tests/test_security_webhooks.py`: Health probes, HMAC SHA256 signature verification, API key authentication, and async webhook ingestion.
-- `tests/test_webhook.py`: Payload normalization across Prometheus/Datadog/Generic alerts, orchestrator pipeline execution, auto-approval workflows, AI failure recovery, and dry-run validation error handling.
+- `tests/test_webhook.py`: Payload normalization across Prometheus/Datadog/Generic alerts, orchestrator pipeline execution, approval workflows, AI failure recovery, and validation error handling.
+
+Run the controlled portfolio scenarios without external services:
+
+```bash
+uv run python scripts/run_scenario.py --all
+uv run python scripts/run_scenario.py scenario-08
+```
+
+The catalog contains twelve scenarios, including unauthorized-file, path-traversal, prompt-injection, malformed-output, and duplicate-approval safe-failure cases.
+
+### Real Portfolio Validation
+
+Five small broken repositories exercise the actual patch safety and isolated-test path:
+
+```bash
+uv run python scripts/run_portfolio_validation.py SC-01
+uv run python scripts/run_portfolio_validation.py SC-02
+uv run python scripts/run_portfolio_validation.py SC-03
+uv run python scripts/run_portfolio_validation.py SC-04
+uv run python scripts/run_portfolio_validation.py SC-05
+uv run python scripts/run_portfolio_validation.py --all
+```
+
+The runner uses deterministic fixture patches, so these commands make zero Gemini calls. It executes the baseline failing test, generates a constrained unified diff, rejects an unauthorized extra-file diff, applies the patch in a temporary workspace, runs the scenario's pytest command, records approval, and calls the real GitHub service. Without an explicitly configured token, the result is `DEMO MODE - NO REAL PR CREATED`.
+
+### Security and Demo Modes
+
+Protected mode is the default: set `API_KEY` and `WEBHOOK_SECRET`; missing credentials are rejected. For an explicitly local demonstration only, set `DEMO_MODE=true` with a non-production `ENVIRONMENT`. The frontend reads `VITE_API_KEY` and sends it as `X-API-Key` when configured.
 
 ---
 
@@ -221,7 +251,7 @@ aletheia/
 
 For complete architectural details, security models, data dictionaries, and design rationale:
 - [**`documentation.md`**](documentation.md) — Exhaustive system reference & technical guide.
-- [**`DEPLOY.md`**](DEPLOY.md) — 100% Free-Tier Cloud Deployment Guide.
+- [**`DEPLOY.md`**](DEPLOY.md) — Optional free-tier demonstration deployment guide.
 - [**`CHANGELOG.md`**](CHANGELOG.md) — Version 1.0.0 release notes.
 
 ---

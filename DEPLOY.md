@@ -1,6 +1,6 @@
-# ALETHEIA — 100% Free-Tier Cloud Deployment Guide
+# ALETHEIA — Optional Free-Tier Demonstration Deployment Guide
 
-Deploy the full ALETHEIA stack (FastAPI Backend, ARQ Background Worker, PostgreSQL DB, Redis Queue, and React Frontend) with **$0/month cost** using modern serverless and free-tier platforms.
+This guide deploys the full ALETHEIA stack (FastAPI backend, ARQ worker, PostgreSQL, Redis, and React frontend) using optional free-tier services. Free-tier availability, quotas, cold starts, and provider behavior can change; this is not a production-readiness claim.
 
 ---
 
@@ -54,6 +54,7 @@ Render's free tier provides 750 hours/month for a single web service. To avoid s
    - `GITHUB_TOKEN`: GitHub Personal Access Token (`repo` scope)
    - `API_KEY`: A generated 32-character secret (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`)
    - `WEBHOOK_SECRET`: A generated secret for HMAC signature verification
+   - `DEMO_MODE`: `false` for protected mode; only use `true` for an explicitly local, non-production demonstration
    - `RUN_WORKER_INPROCESS`: `true`
    - `FRONTEND_ORIGINS`: Your Vercel domain (e.g. `https://aletheia.vercel.app,http://localhost:5174`)
 
@@ -63,7 +64,7 @@ Render's free tier provides 750 hours/month for a single web service. To avoid s
 3. Configure settings:
    - **Name:** `aletheia-api`
    - **Runtime:** `Python 3`
-   - **Build Command:** `pip install -r requirements.txt`
+   - **Build Command:** `uv sync`
    - **Start Command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
    - **Plan:** `Free`
 4. Add the Environment Variables listed in Option A.
@@ -103,3 +104,5 @@ Your backend will be live at: `https://aletheia-api.onrender.com` (Health check:
    ```
 4. The incident appears in real-time on your dashboard.
 5. Review the AI-generated diff and approve to open a GitHub PR!
+
+Before calling the deployment successful, verify that the job reaches `VALIDATION_PASSED` after targeted checks. A missing `GITHUB_TOKEN` must display `DEMO MODE - NO REAL PR CREATED`; it is not a real PR.

@@ -22,6 +22,7 @@ import pytest
 
 # Set test environment before any app imports resolve settings
 os.environ["ENVIRONMENT"] = "development"
+os.environ["DEMO_MODE"] = "true"
 os.environ["API_KEY"] = ""
 os.environ["WEBHOOK_SECRET"] = ""
 os.environ["REDIS_URL"] = "redis://localhost:6379/0"  # Not actually connected in tests
@@ -58,6 +59,7 @@ def client():
     ):
         # Make AsyncSessionLocal() usable as an async context manager
         mock_session = AsyncMock()
+        mock_session.add = MagicMock()
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_session_factory.return_value = mock_session

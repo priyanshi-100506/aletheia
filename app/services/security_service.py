@@ -17,9 +17,7 @@ logger = logging.getLogger("aletheia")
 def verify_webhook_signature(payload_bytes: bytes, signature_header: str | None) -> bool:
     """Verify the HMAC-SHA256 webhook signature.
 
-    If `WEBHOOK_SECRET` is not configured, the check is skipped and all
-    requests are accepted — appropriate for local development but not for
-    production deployments.
+    Unsigned requests are accepted only in explicitly configured demo mode.
 
     The expected header format is `sha256=<hex_digest>` (GitHub / Datadog style).
     Raw hex digests without the prefix are also accepted for compatibility.
@@ -29,12 +27,15 @@ def verify_webhook_signature(payload_bytes: bytes, signature_header: str | None)
         signature_header: Value of the `X-Hub-Signature-256` header.
 
     Returns:
-        True if the signature is valid (or if no secret is configured).
+        True if the signature is valid, or if explicit demo mode is enabled.
         False if the signature is missing or does not match.
     """
-    if not settings.WEBHOOK_SECRET:
-        # Open mode: no secret configured, allow all requests
+    if settings.DEMO_MODE and settings.ENVIRONMENT != "production" and not settings.WEBHOOK_SECRET:
         return True
+
+    if not settings.WEBHOOK_SECRET:
+        logger.error("Webhook secret is not configured in protected mode")
+        return False
 
     if not signature_header:
         logger.warning("Webhook received without X-Hub-Signature-256 header")

@@ -100,7 +100,7 @@ def test_orchestrator_full_pipeline_auto_approve(monkeypatch):
     async def fake_generate(db, error_log, target_file, job_id):
         return patch, job
 
-    async def fake_dry_run(repo_root, unified_diff, dry_run):
+    async def fake_dry_run(*args, **kwargs):
         return {"status": "dry_run_passed"}
 
     async def fake_pr(*args, **kwargs):
@@ -109,6 +109,7 @@ def test_orchestrator_full_pipeline_auto_approve(monkeypatch):
     monkeypatch.setattr(orchestrator, "AsyncSessionLocal", _SessionFactory(session))
     monkeypatch.setattr(orchestrator, "generate_patch", fake_generate)
     monkeypatch.setattr(orchestrator, "apply_unified_diff", fake_dry_run)
+    monkeypatch.setattr(orchestrator, "validate_in_isolated_workspace", fake_dry_run)
     monkeypatch.setattr(orchestrator, "create_pull_request", fake_pr)
 
     ctx = {}  # ARQ context (not used in tests)
@@ -117,7 +118,7 @@ def test_orchestrator_full_pipeline_auto_approve(monkeypatch):
     )
 
     assert result["pr_url"].endswith("/pull/99")
-    assert PatchStatus.DRY_RUN_PASSED in session.committed_statuses
+    assert PatchStatus.VALIDATION_PASSED in session.committed_statuses
     assert PatchStatus.PR_CREATED in session.committed_statuses
 
 
@@ -131,12 +132,13 @@ def test_orchestrator_awaits_approval_when_auto_approve_false(monkeypatch):
     async def fake_generate(db, error_log, target_file, job_id):
         return patch, job
 
-    async def fake_dry_run(repo_root, unified_diff, dry_run):
+    async def fake_dry_run(*args, **kwargs):
         return {"status": "dry_run_passed"}
 
     monkeypatch.setattr(orchestrator, "AsyncSessionLocal", _SessionFactory(session))
     monkeypatch.setattr(orchestrator, "generate_patch", fake_generate)
     monkeypatch.setattr(orchestrator, "apply_unified_diff", fake_dry_run)
+    monkeypatch.setattr(orchestrator, "validate_in_isolated_workspace", fake_dry_run)
 
     ctx = {}
     result = asyncio.run(
@@ -184,7 +186,7 @@ def test_orchestrator_marks_failed_on_dry_run_error(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "AsyncSessionLocal", _SessionFactory(session))
     monkeypatch.setattr(orchestrator, "generate_patch", fake_generate)
-    monkeypatch.setattr(orchestrator, "apply_unified_diff", failing_dry_run)
+    monkeypatch.setattr(orchestrator, "validate_in_isolated_workspace", failing_dry_run)
 
     ctx = {}
     result = asyncio.run(
@@ -193,4 +195,4 @@ def test_orchestrator_marks_failed_on_dry_run_error(monkeypatch):
 
     assert result["status"] == "failed"
     assert "conflict" in result["error"]
-    assert PatchStatus.FAILED in session.committed_statuses
+    assert PatchStatus.VALIDATION_FAILED in session.committed_statuses

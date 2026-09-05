@@ -111,3 +111,15 @@ def test_sanitize_output_redacts_credentials():
 
     assert raw_token not in sanitized
     assert "[REDACTED" in sanitized
+
+
+def test_patch_rejects_unexpected_target_file():
+    from app.services.git_applier import PatchApplicationError, _validate_diff_paths
+
+    diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+    try:
+        _validate_diff_paths(diff, allowed_target="authentication.py")
+    except PatchApplicationError as exc:
+        assert "outside" in str(exc)
+    else:
+        raise AssertionError("unexpected patch target was accepted")

@@ -1,8 +1,8 @@
 # ALETHEIA — Technical Architecture & v1 Reference
 
 > **Version:** 1.0.0 — v1 Freeze  
-> **Status:** Production-ready  
-> Last updated: 2026-09-04
+> **Status:** Portfolio-ready controlled remediation workflow; not production-ready autonomous remediation.
+> Last updated: 2026-09-05
 
 ---
 
@@ -25,12 +25,12 @@
 
 ## 1. What ALETHEIA Does
 
-ALETHEIA is an autonomous AIOps platform. When your monitoring system fires an alert, ALETHEIA:
+ALETHEIA is a constrained AIOps remediation workflow. When a monitoring system fires an alert, ALETHEIA:
 
 1. **Receives** the alert via a secure HTTP webhook
 2. **Analyzes** the error log using Google Gemini AI with the actual source file as context
 3. **Generates** a unified diff patch to fix the root cause
-4. **Validates** the patch with `git apply --check` in an isolated temporary Git worktree
+4. **Applies and validates** the patch in an isolated temporary checkout, enforcing the requested target file and running targeted tests/checks
 5. **Presents** the diff to an on-call engineer in the React UI for review
 6. **Creates** a GitHub Pull Request after explicit human approval
 
@@ -69,9 +69,12 @@ External Monitoring (Datadog / Prometheus / Custom HTTP)
 │    - Store PatchResult in PostgreSQL        │
 │    → Status: GENERATING → GENERATED        │
 │                                             │
-│  Stage 2: apply_unified_diff(dry_run=True)  │
-│    - Run git apply --check in temp worktree │
-│    → Status: DRY_RUN_PASSED                │
+│  Stage 2: isolated validation              │
+│    - Enforce allowed target paths          │
+│    - Apply patch in temporary checkout     │
+│    - Run targeted tests or syntax checks    │
+│    → Status: PATCH_APPLIED                 │
+│    → Status: VALIDATION_PASSED/FAILED      │
 │                                             │
 │  Stage 3: Await human approval              │
 │    → Status: WAIT_FOR_APPROVAL             │
@@ -158,8 +161,9 @@ Single source of truth for all configuration. Uses `pydantic-settings` to read f
 
 **PatchStatus enum lifecycle:**
 ```
-PENDING → GENERATING → GENERATED → DRY_RUN_PASSED → WAIT_FOR_APPROVAL
-                                                   → PR_CREATED (auto-approve)
+PENDING → GENERATING → GENERATED → PATCH_APPLIED → VALIDATION_PASSED
+                                                   → WAIT_FOR_APPROVAL → APPROVING → PR_CREATED
+                                      └────────────→ VALIDATION_FAILED
 Any state → FAILED (on error)
 PR_CREATED → APPLIED (after merge, set manually or via webhook)
 ```
@@ -168,8 +172,9 @@ PR_CREATED → APPLIED (after merge, set manually or via webhook)
 `AuditLog` — append-only audit trail. Never delete rows. One row per significant event. Used by the React Activity Log screen.
 
 **Standard event_type values:**
-`WEBHOOK_INGESTED`, `PIPELINE_STARTED`, `PATCH_GENERATED`, `DRY_RUN_PASSED`,
-`AWAITING_APPROVAL`, `APPROVAL_GRANTED`, `REJECTED`, `PR_CREATED`, `PIPELINE_FAILED`
+`WEBHOOK_INGESTED`, `PIPELINE_STARTED`, `PATCH_GENERATED`, `PATCH_APPLIED`,
+`VALIDATION_PASSED`, `VALIDATION_FAILED`, `AWAITING_APPROVAL`,
+`APPROVAL_GRANTED`, `REJECTED`, `PR_CREATED`, `PIPELINE_FAILED`
 
 ### `app/schemas/webhook.py`
 Alert payload normalization. Maps 3 provider formats to `GenericAlertPayload(error_log, target_file)`:
@@ -192,9 +197,10 @@ Gemini AI integration. Builds a structured prompt from the error log and source 
 ### `app/services/git_applier.py`
 Git patch validation and application:
 - `sanitize_diff()` — strips markdown code fences, normalizes line endings
-- `_validate_diff_paths()` — rejects patches with absolute paths or `..` traversal
+- `_validate_diff_paths()` — rejects absolute paths, `..` traversal, missing headers, and files outside the requested target
 - `_repository_path()` — ensures repo path is within the configured `REPO_PATH` boundary
-- `apply_unified_diff(dry_run=True)` — runs `git apply --check --recount --ignore-whitespace`
+- `apply_unified_diff()` — checks and applies a constrained diff
+- `validate_in_isolated_workspace()` — copies the repository to a temporary checkout, applies the patch, and runs a supplied test command or `py_compile`
 
 ### `app/services/github_service.py`
 Pull request creation:
@@ -205,7 +211,7 @@ Pull request creation:
 5. Calls `POST https://api.github.com/repos/{owner}/{repo}/pulls`
 6. Cleans up worktree
 
-If `GITHUB_TOKEN` is not set, returns a simulated response for local development.
+If `GITHUB_TOKEN` is not set, returns `DEMO MODE - NO REAL PR CREATED` with no fabricated URL or PR number. When configured, the service searches for an existing branch PR before pushing and creating a new one.
 
 ### `app/services/security_service.py`
 HMAC-SHA256 webhook signature verification. Stateless. Accepts `sha256=<hex>` prefix format (GitHub/Datadog style) or raw hex. Returns `True` if `WEBHOOK_SECRET` is unset (dev mode).
@@ -327,7 +333,7 @@ All endpoints are under `/api/v1`. All require `X-API-Key` header unless `ENVIRO
 ## 8. Security Architecture
 
 ### 1. HMAC Webhook Signature Verification
-Every inbound webhook is validated against `WEBHOOK_SECRET` using HMAC-SHA256 before any processing occurs. Invalid signatures return HTTP 401. This prevents spoofed alerts from triggering AI-driven code changes.
+Every inbound webhook is validated against `WEBHOOK_SECRET` using HMAC-SHA256 before any processing occurs. Invalid or unsigned signatures return HTTP 401 in protected mode. Unsigned requests are accepted only when explicit non-production `DEMO_MODE=true` is set.
 
 ### 2. Redis Rate Limiting
 Sliding-window rate limiter per client IP using Redis sorted sets. Default: 30 requests per 60-second window. Returns HTTP 429 on excess. Persists across restarts and works correctly with multiple API server replicas.
@@ -350,8 +356,8 @@ All git errors and GitHub API exception strings pass through `_sanitize_output()
 ### 8. TOCTOU Race Condition Prevention
 Before creating PR branches upon human approval, `approve_and_create_pr()` performs a dry-run re-verification against current repository `HEAD`. If the codebase has diverged since generation, the job fails gracefully rather than applying a conflicting patch.
 
-### 9. Git Worktree Isolation
-All patch application (dry-run and real) happens in a temporary `git worktree` — a separate directory linked to the same repo object. The primary working directory is never modified. Worktrees are always cleaned up in a `finally` block.
+### 9. Isolated Validation and Git Worktrees
+Validation copies the repository into a temporary checkout, applies the patch, and runs targeted checks. The primary working directory is never modified. Real GitHub PR creation uses a separate temporary Git worktree and cleans it up in a `finally` block.
 
 ### 10. Append-Only Audit Trail
 `audit_logs` table is written to but never updated or deleted. Every security event, approval, and rejection is permanently recorded with timestamp, actor, and structured details.
@@ -454,11 +460,21 @@ uv run pytest tests/ -v
 
 Tests do NOT require live PostgreSQL or Redis. All external I/O is mocked via `tests/conftest.py`.
 
-### Test Coverage by File (16/16 Passing)
+### Test Coverage by File (20/20 Passing at last validation)
 | Test file | What it covers |
 |-----------|---------------|
 | `test_security_webhooks.py` | Health probe, 202 acceptance, Prometheus payloads, HMAC valid/invalid verification, path traversal blocking, sensitive file blocking, token scrubbing, and /patch/apply direct mutation denial (403). |
-| `test_webhook.py` | Alert normalization (Generic, Prometheus, Datadog), orchestrator pipeline execution, auto-approve workflows, AI generation failure recovery, and dry-run validation error handling. |
+| `test_webhook.py` | Alert normalization (Generic, Prometheus, Datadog), orchestrator pipeline execution, approval workflows, AI generation failure recovery, and validation error handling. |
+
+### Portfolio Validation
+
+Five broken fixture repositories exercise the real safety and isolated-test path without external services:
+
+```bash
+uv run python scripts/run_portfolio_validation.py --all
+```
+
+The fixtures cover None handling, HTTP error handling, API input validation, a SQLite query bug, and an existing regression test. Patch generation is deterministic for this demonstration, so Gemini calls are zero. Approval is recorded locally, and absent GitHub credentials produce `DEMO MODE - NO REAL PR CREATED`.
 
 ### Adding a New Service
 
@@ -483,6 +499,6 @@ Tests do NOT require live PostgreSQL or Redis. All external I/O is mocked via `t
 | DB ORM | **SQLAlchemy async** | raw asyncpg, tortoise-orm | Mature ecosystem, typed mapped columns, async-native in v2 |
 | Session pattern | **Per-operation sessions** | Single long-lived session | Avoids connection leaks across long AI/git operations; async context manager ensures cleanup |
 | Rate limiting | **Redis sorted set** | In-memory dict | Survives restarts; shared across replicas; O(log n) sliding window |
-| Patch validation | **git apply --check** | applying to temp copy | Uses the actual git conflict detection algorithm; handles 3-way merge |
+| Patch validation | **isolated apply plus targeted tests** | `git apply --check` alone | Separates patch applicability from evidence that the relevant behavior passes |
 | PR isolation | **git worktree** | temp clone | Same repo object (fast); primary working directory untouched; native git feature |
 | Approval gate | **Server-side endpoint** | Frontend-only | Cannot be bypassed by manipulating the React UI; full audit trail |

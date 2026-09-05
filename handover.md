@@ -2,7 +2,9 @@
 
 ## 1. Project Summary
 
-ALETHEIA is an autonomous AIOps incident remediation platform with a FastAPI backend, an asynchronous ARQ + Redis worker pipeline, and a React/Vite operational command center frontend. It ingests monitoring alerts (Datadog, Prometheus, generic webhooks), normalizes payloads, generates unified code diff patches using Google Gemini 2.0 Flash AI, validates patches inside isolated Git worktrees, and exposes a human-in-the-loop approval workflow to open GitHub Pull Requests.
+ALETHEIA is a constrained incident-to-validated-patch portfolio workflow with a FastAPI backend, an asynchronous ARQ + Redis worker pipeline, and a React/Vite operational command center frontend. It ingests monitoring alerts (Datadog, Prometheus, generic webhooks), normalizes payloads, generates unified code diff patches using Google Gemini 2.0 Flash when configured, validates patches in isolated temporary checkouts with targeted tests, and exposes a human-in-the-loop approval workflow for GitHub Pull Requests.
+
+**Scope boundary:** ALETHEIA is not currently a fully autonomous production remediation system. The deterministic portfolio runner uses fixture-backed patches and zero Gemini calls. Without GitHub credentials, it reports `DEMO MODE - NO REAL PR CREATED`.
 
 The frontend is an operational command center built under the Orchid Noir design system (`frontend_blueprint.md`).
 
@@ -10,7 +12,7 @@ The frontend is an operational command center built under the Orchid Noir design
 
 ## 2. Production & Security Upgrades Delivered
 
-The platform has been hardened from a prototype into an engineering-grade, production-ready AIOps platform:
+The platform has been hardened from a prototype into a credible, reproducible portfolio demonstration:
 
 ### Asynchronous Queue & Distributed State
 - **ARQ + Redis Queue (`app/worker.py`, `app/services/queue_service.py`):** Asynchronous background job processing with deterministic job IDs, configurable concurrency, and automatic retries.
@@ -22,25 +24,29 @@ The platform has been hardened from a prototype into an engineering-grade, produ
 - **Path Traversal & Sensitive File Defense (`_safe_read_target_file`):** Strictly enforces `Path.is_relative_to(repo_root)` and blocks access to `.env`, `id_rsa`, `*.pem`, `*.key` from LLM context.
 - **Prompt Injection Defense:** Encapsulates raw error logs and source files in strict XML tags (`<error_log>`, `<target_file>`).
 - **Direct Apply Lockdown:** `POST /api/v1/patch/apply` returns `403 Forbidden` for `dry_run=False`, ensuring all live mutations require the approval-gated PR workflow.
+- **Explicit Security Modes:** Protected mode requires `API_KEY` and `WEBHOOK_SECRET`. Unsigned local requests are allowed only with explicit non-production `DEMO_MODE=true`.
+- **Target-File Policy:** Unified diffs reject absolute paths, traversal, missing headers, and modifications outside the requested target file.
+- **Isolated Test Validation:** Patches are applied in a temporary checkout and validated with targeted tests or syntax checks. `PATCH_APPLIED`, `VALIDATION_PASSED`, and `VALIDATION_FAILED` are distinct states.
+- **Honest GitHub Behavior:** Demo mode has no fabricated PR URL or number. Configured GitHub mode searches for an existing branch PR before creating another one.
 - **Credential & Token Scrubbing (`_sanitize_output`):** Redacts PATs, GitHub tokens, and auth remote URLs from git errors, audit logs, and HTTP error responses.
-- **TOCTOU Race Prevention:** Performs pre-approval dry-run verification against repository `HEAD` before opening PR branches.
+- **TOCTOU Race Prevention:** Performs pre-approval verification against repository `HEAD` before opening PR branches.
 
 ### Reliability & Audit Logging
-- **Append-Only Audit Log (`audit_logs` table):** Tracks all pipeline lifecycle events (`WEBHOOK_INGEST`, `PATCH_GENERATED`, `DRY_RUN_PASSED`, `APPROVAL_GRANTED`, `REJECTED`, `PR_CREATED`) for auditability.
+- **Append-Only Audit Log (`audit_logs` table):** Tracks lifecycle events including `PATCH_GENERATED`, `PATCH_APPLIED`, `VALIDATION_PASSED`, `VALIDATION_FAILED`, `APPROVAL_GRANTED`, `REJECTED`, and `PR_CREATED`.
 - **Exponential Backoff Retries:** Handles transient Gemini LLM or GitHub API rate-limits gracefully with `tenacity`.
 - **Structured LLM Generation:** Pydantic `PatchResult` schema enforced via Gemini `response_schema`.
 
 ### Frontend Command Center (Orchid Noir System)
 - **5 Operational Screens:**
   1. **Incidents:** Dense table displaying open incidents, confidence, age, and status.
-  2. **Review Queue:** Safety-critical view filtered specifically for dry-run validated patches.
+  2. **Review Queue:** Safety-critical view filtered specifically for validated patches awaiting human approval.
   3. **Repositories:** Displays Git connection health, worktree isolation status, and diff policy limits.
   4. **Activity:** Real-time audit log stream.
   5. **Settings:** Integration status, HMAC secrets, and concurrency limits.
 - **Diff Viewer Component (`DiffViewer.tsx`):** Split/unified code diff viewer with line numbers, copy actions, patch size risk warnings, and approval/rejection modals.
 - **Alert Ingestion Modal (`AlertIngestModal.tsx`):** UI component to simulate and ingest alert trace payloads directly from the browser.
 
-### Cloud Deployment (100% Free-Tier Architecture)
+### Optional Free-Tier Demonstration Deployment
 - **Render:** Free Web Service running FastAPI + ARQ worker in-process (`RUN_WORKER_INPROCESS=true`).
 - **Neon:** Free Serverless PostgreSQL with auto-handled SSL (`sslmode=require`).
 - **Upstash:** Free Serverless TLS Redis (`rediss://...`).
@@ -72,6 +78,7 @@ GITHUB_BASE_BRANCH=main
 REDIS_URL=redis://127.0.0.1:6379/0
 API_KEY=your_32_char_secret_key
 WEBHOOK_SECRET=your_hmac_secret
+DEMO_MODE=false
 RUN_WORKER_INPROCESS=false
 ENVIRONMENT=development
 ```
@@ -80,10 +87,11 @@ ENVIRONMENT=development
 
 ## 5. Automated Test & Verification Commands
 
-Backend test suite (**16/16 tests passing**):
+Backend test suite (**20/20 tests passing at last validation**):
 ```powershell
 uv run pytest tests/ -v
 uv run python -m compileall -q app
+uv run python scripts/run_portfolio_validation.py --all
 ```
 
 Frontend checks:
@@ -92,11 +100,13 @@ cd frontend
 npm run build
 ```
 
+The portfolio runner creates five temporary Git repositories, verifies that each baseline test fails, applies a deterministic constrained patch in an isolated checkout, runs the relevant pytest command, records a local approval, and calls the GitHub service. It uses zero Gemini calls. Without `GITHUB_TOKEN`, it reports `DEMO MODE - NO REAL PR CREATED`.
+
 ---
 
 ## 6. Engineering Documentation & Learning Guide
 
-- [documentation.md](file:///c:/Users/USER/Documents/aletheia/documentation.md) — Comprehensive technical reference and decision log.
-- [DEPLOY.md](file:///c:/Users/USER/Documents/aletheia/DEPLOY.md) — Free-tier cloud deployment guide (Render, Neon, Upstash, Vercel).
-- [learnings.md](file:///c:/Users/USER/Documents/aletheia/learnings.md) — First-principles engineering concepts, security deep dives, and interview talking points.
-- [CHANGELOG.md](file:///c:/Users/USER/Documents/aletheia/CHANGELOG.md) — Release notes for v1.0.0.
+- [documentation.md](documentation.md) — Comprehensive technical reference and decision log.
+- [DEPLOY.md](DEPLOY.md) — Free-tier deployment guide with protected/demo-mode caveats.
+- [learnings.md](learnings.md) — First-principles engineering concepts, security deep dives, and interview talking points.
+- [CHANGELOG.md](CHANGELOG.md) — Release notes and known limitations.

@@ -52,7 +52,7 @@ Right column:
 - Patch review panel with file tabs, unified diff, added/removed line counts, and affected-file count.
 - Actions: approve and create PR, reject, retry, or open repository.
 
-The primary action must remain disabled until dry-run validation passes and the user has reviewed the diff.
+The primary action must remain disabled until isolated validation passes and the user has reviewed the diff. A clean patch application alone is not sufficient.
 
 ### Patch Review
 
@@ -74,7 +74,8 @@ An event timeline should show:
 - Payload normalized.
 - Job persisted.
 - Gemini generation started/completed.
-- Dry-run started/passed/failed.
+- Patch applied in isolated workspace.
+- Targeted validation started/passed/failed, including command and evidence.
 - Worktree created and branch pushed.
 - Pull request created.
 - Failure reason and retry eligibility.

@@ -49,7 +49,7 @@ async def ingest_alert(
 
     **Headers:**
     - `X-API-Key` — required unless ENVIRONMENT=development and API_KEY is unset
-    - `X-Hub-Signature-256` — optional HMAC signature (required if WEBHOOK_SECRET is set)
+    - `X-Hub-Signature-256` — required outside explicit demo mode
     - `X-Idempotency-Key` — optional deduplication key (prevents double-processing)
 
     **Body:** Any of:

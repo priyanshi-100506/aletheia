@@ -30,6 +30,9 @@ def _serialize_job(job: RemediationJob) -> dict:
         "explanation": job.explanation,
         "unified_diff": job.unified_diff,
         "confidence_score": job.confidence_score,
+        "pr_url": job.pr_url,
+        "pr_number": job.pr_number,
+        "pr_simulated": job.pr_simulated,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }

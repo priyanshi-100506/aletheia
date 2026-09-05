@@ -52,8 +52,9 @@ class Settings(BaseSettings):
     FRONTEND_ORIGINS: str = "http://127.0.0.1:5174,http://localhost:5174"
 
     # ── Runtime ───────────────────────────────────────────────────────────────
-    # "development" skips API-key enforcement; "production" enforces all guards
+    # Demo mode is an explicit local-only opt-in. Protected mode is the default.
     ENVIRONMENT: str = "development"
+    DEMO_MODE: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

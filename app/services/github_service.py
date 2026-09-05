@@ -61,13 +61,32 @@ async def create_pull_request(
             branch,
         )
         return {
-            "pr_url": f"https://github.com/aletheia-app/repository/pull/{branch_name[:6]}",
-            "html_url": f"https://github.com/aletheia-app/repository/pull/{branch_name[:6]}",
-            "number": 101,
+            "pr_url": None,
+            "html_url": None,
+            "number": None,
             "simulated": True,
+            "mode": "DEMO MODE - NO REAL PR CREATED",
         }
 
     remote = await asyncio.to_thread(_git, str(repository_path), "remote", "get-url", "origin")
+
+    repository = target_repo or remote
+    if "://" in repository:
+        repository = urlparse(repository).path
+    else:
+        repository = repository.split(":", 1)[-1]
+    repository = repository.strip("/").removesuffix(".git")
+    url = f"https://api.github.com/repos/{repository}/pulls"
+    timeout = httpx.Timeout(15.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        existing = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            params={"head": f"{repository.split('/')[-2]}:{branch}", "base": base_branch, "state": "all"},
+        )
+        if existing.status_code < 400 and existing.json():
+            data = existing.json()[0]
+            return {"pr_url": data["html_url"], "url": data["html_url"], "number": data.get("number"), "data": data, "reused": True}
 
     # 1. Create worktree, apply patch, commit & push branch to remote
     with tempfile.TemporaryDirectory(prefix="aletheia-worktree-") as worktree:
@@ -109,14 +128,6 @@ async def create_pull_request(
             except Exception:
                 pass
 
-    repository = target_repo or remote
-    if "://" in repository:
-        repository = urlparse(repository).path
-    else:
-        repository = repository.split(":", 1)[-1]
-    repository = repository.strip("/").removesuffix(".git")
-    url = f"https://api.github.com/repos/{repository}/pulls"
-    timeout = httpx.Timeout(15.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             url,

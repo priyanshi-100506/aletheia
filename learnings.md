@@ -9,13 +9,13 @@ This document breaks down **ALETHEIA** from first principles. It is written to g
 ### What problem does ALETHEIA solve?
 In modern cloud environments (Kubernetes, AWS, Datadog, Prometheus), software systems crash or throw exceptions continuously. On-call engineers receive alerts via PagerDuty/Datadog and manually inspect logs, locate source code, write a patch, run local tests, and open a GitHub Pull Request (PR).
 
-**ALETHEIA (Autonomous AIOps Platform)** automates the entire incident remediation pipeline:
+**ALETHEIA (constrained AIOps remediation workflow)** automates the controlled incident-to-PR path:
 1. **Ingest & Validate:** Accepts alert webhooks with HMAC-SHA256 verification and Redis rate-limiting.
 2. **Asynchronous Queue:** Offloads processing to an ARQ background worker over Redis, ensuring deterministic job IDs and instantaneous HTTP 202 responses.
 3. **Analyze & Fix:** Uses Google Gemini 2.0 Flash AI with source code context inside strict path boundaries to generate a unified Git patch diff (`.patch`).
-4. **Validate:** Executes an automated Git dry-run (`git apply --check`) inside an isolated temporary Git worktree.
+4. **Validate:** Applies the patch in an isolated temporary checkout, enforces the allowed target file, and runs targeted tests or syntax checks.
 5. **Human Safety Gate:** Displays the diff in an operational command center UI for human review.
-6. **Remediate:** Performs TOCTOU dry-run re-verification, commits inside a fresh worktree, pushes to GitHub, and opens a Pull Request upon human approval.
+6. **Remediate:** Performs pre-approval re-verification, records human approval, and creates or reuses one GitHub Pull Request when credentials are configured. Otherwise it reports demo mode without fabricating PR data.
 
 ---
 
@@ -42,7 +42,7 @@ In modern cloud environments (Kubernetes, AWS, Datadog, Prometheus), software sy
 │                                                        │
 │ 1. Safe Source Read: Path traversal & .env blocking   │
 │ 2. Gemini 2.0 Flash: Structured JSON PatchResult       │
-│ 3. Dry-Run Validation: git apply --check in worktree   │
+│ 3. Isolated Apply + Targeted Tests                     │
 │ 4. Set status: WAIT_FOR_APPROVAL                       │
 └───────────┬────────────────────────────────────────────┘
             │
@@ -78,9 +78,10 @@ In modern cloud environments (Kubernetes, AWS, Datadog, Prometheus), software sy
 * **Prompt Delimitation:** Raw error logs and source files are wrapped in explicit XML tags (`<error_log>`, `<target_file>`) to prevent prompt injection and delimiter confusion.
 * **Structured Output Schema:** Rather than raw markdown, we enforce Pydantic structured output (`PatchResult`) from Gemini containing `bug_description`, `explanation`, `unified_diff`, and `confidence_score`.
 
-### D. Git Worktree Isolation & Dry-Run Testing
+### D. Isolated Validation & Git Worktree Testing
 * **Why not test directly in the working directory?** Modifying the main checked-out branch can corrupt live server code or cause race conditions when multiple incidents run concurrently.
-* **Git Worktrees (`git worktree`):** ALETHEIA creates a temporary, detached Git worktree directory on disk, applies the unified diff (`git apply`), verifies syntactic correctness, and deletes the worktree in a `finally` block. The main checkout remains untouched.
+* **Temporary validation checkout:** ALETHEIA copies the repository to a temporary checkout, applies the constrained unified diff, and runs the supplied targeted test command. The main checkout remains untouched.
+* **Git worktrees for PRs:** The GitHub service creates a temporary detached worktree for branch, commit, and push operations, then cleans it up in a `finally` block.
 
 ### E. Human-in-the-Loop Safety Approval Gate & TOCTOU Protection
 * **Server-Side Enforcement:** Automated AI code pushes to production branches carry risk. Direct mutation via `/api/v1/patch/apply` is locked down (`dry_run=False` returns `403 Forbidden`).
@@ -115,4 +116,4 @@ In modern cloud environments (Kubernetes, AWS, Datadog, Prometheus), software sy
 | **AI Model** | Google Gemini 2.0 Flash | High-speed structured JSON generation for patch diffs |
 | **Frontend UI** | React 18 + TypeScript + Vite | Type-safe, instant HMR build, modular component design |
 | **Design System** | Orchid Noir + TailwindCSS | Dark, professional, operational incident command system design |
-| **Cloud Hosting** | Render + Neon + Upstash + Vercel | 100% Free-Tier ($0/mo) production-ready deployment architecture |
+| **Cloud Hosting** | Render + Neon + Upstash + Vercel | Optional free-tier demonstration deployment; not a production-readiness claim |

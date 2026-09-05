@@ -3,9 +3,21 @@
 All notable changes to ALETHEIA are documented here.
 Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased] — 2026-09-05 — Portfolio Validation
+
+### Added
+- Five small broken fixture repositories covering None handling, HTTP error handling, API input validation, a SQLite query bug, and an existing regression test.
+- `scripts/run_portfolio_validation.py` for deterministic, zero-Gemini portfolio validation.
+- Isolated validation with scenario-specific pytest commands and recorded stdout/stderr evidence.
+- Explicit target-file rejection probes for unauthorized extra-file patches.
+
+### Changed
+- Documentation now distinguishes `PATCH_APPLIED`, `VALIDATION_PASSED`, `VALIDATION_FAILED`, approval, and real versus demo PR outcomes.
+- Deployment and handover guidance no longer describes ALETHEIA as production-ready autonomous remediation.
+
 ---
 
-## [1.0.0] — 2026-09-04 — v1 Production Freeze
+## [1.0.0] — 2026-09-04 — v1 Prototype Freeze
 
 ### Added
 
@@ -25,7 +37,7 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `app/services/redis_store.py`: Redis sliding-window rate limiter and atomic idempotency store, replacing in-memory dicts.
 
 **Cloud Deployment & Infrastructure**
-- `DEPLOY.md` — Step-by-step 100% Free-Tier Cloud Deployment Guide for Render (FastAPI + Worker), Neon (PostgreSQL), Upstash (Redis), and Vercel (React Frontend).
+- `DEPLOY.md` — Optional free-tier demonstration deployment guide for Render (FastAPI + Worker), Neon (PostgreSQL), Upstash (Redis), and Vercel (React Frontend).
 - `render.yaml` — Render Infrastructure-as-Code Blueprint.
 - `frontend/vercel.json` — Vercel SPA rewrite and caching configuration.
 - `app/db/database.py` — Auto-normalizes Neon connection strings (`sslmode=require` → `ssl=require`).
@@ -66,6 +78,6 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests
 
-- **16 tests**, 100% passing.
+- **20 tests**, passing at the 2026-09-05 validation run.
 - `test_security_webhooks.py` — Health, ingest, Prometheus normalization, HMAC signatures, path traversal blocking, sensitive file filtering, token scrubbing, and /patch/apply direct mutation lockdown.
-- `test_webhook.py` — Alert normalization (Generic, Prometheus, Datadog), orchestrator pipeline execution, auto-approve workflows, AI failure recovery, and dry-run validation error handling.
+- `test_webhook.py` — Alert normalization (Generic, Prometheus, Datadog), orchestrator pipeline execution, approval workflows, AI failure recovery, and validation error handling.

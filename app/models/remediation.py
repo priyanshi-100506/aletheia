@@ -29,8 +29,12 @@ class PatchStatus(str, enum.Enum):
     PENDING = "PENDING"
     GENERATING = "GENERATING"
     GENERATED = "GENERATED"
+    PATCH_APPLIED = "PATCH_APPLIED"
+    VALIDATION_PASSED = "VALIDATION_PASSED"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
     DRY_RUN_PASSED = "DRY_RUN_PASSED"
     WAIT_FOR_APPROVAL = "WAIT_FOR_APPROVAL"
+    APPROVING = "APPROVING"
     PR_CREATED = "PR_CREATED"
     APPLIED = "APPLIED"
     FAILED = "FAILED"
@@ -65,6 +69,11 @@ class RemediationJob(Base):
         Enum(PatchStatus), default=PatchStatus.PENDING, nullable=False, index=True
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Persist the external side effect so retries can reconcile it.
+    pr_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    pr_number: Mapped[int | None] = mapped_column(nullable=True)
+    pr_simulated: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     # Timestamps — stored as UTC, use timezone.utc throughout
     created_at: Mapped[datetime] = mapped_column(

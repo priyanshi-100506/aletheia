@@ -20,11 +20,12 @@ Session management:
 """
 import asyncio
 import logging
+from sqlalchemy import update
 
 from app.db.database import AsyncSessionLocal
 from app.models.audit import AuditLog
 from app.models.remediation import PatchStatus, RemediationJob
-from app.services.git_applier import apply_unified_diff
+from app.services.git_applier import apply_unified_diff, validate_in_isolated_workspace
 from app.services.github_service import create_pull_request
 from app.services.patcher import generate_patch
 from app.config import settings
@@ -149,17 +150,19 @@ async def process_remediation_job(
 
         # ── Stage 2: Dry-run validation ───────────────────────────────────────
         try:
-            await apply_unified_diff(
+            await validate_in_isolated_workspace(
                 repo_root=settings.REPO_PATH,
                 unified_diff=patch.unified_diff,
-                dry_run=True,
+                allowed_target=patch.file_path,
             )
-            await _update_status(job_id, PatchStatus.DRY_RUN_PASSED)
-            await _record_audit(job_id, "DRY_RUN_PASSED")
+            await _update_status(job_id, PatchStatus.PATCH_APPLIED)
+            await _update_status(job_id, PatchStatus.VALIDATION_PASSED)
+            await _record_audit(job_id, "PATCH_APPLIED")
+            await _record_audit(job_id, "VALIDATION_PASSED", details={"checks": ["git_apply", "py_compile"]})
         except Exception as exc:
             error_msg = str(exc)
             logger.error("Dry-run validation failed for job %s: %s", job_id, error_msg)
-            await _update_status(job_id, PatchStatus.FAILED, error=error_msg)
+            await _update_status(job_id, PatchStatus.VALIDATION_FAILED, error=error_msg)
             await _record_audit(job_id, "PIPELINE_FAILED", details={"stage": "dry_run", "error": error_msg})
             return {"status": "failed", "error": error_msg}
 
@@ -191,7 +194,13 @@ async def approve_and_create_pr(job_id: str, actor: str = "on_call_engineer") ->
         job = await db.get(RemediationJob, job_id)
         if job is None:
             raise ValueError(f"Job {job_id} not found")
-        if job.status not in (PatchStatus.DRY_RUN_PASSED, PatchStatus.WAIT_FOR_APPROVAL):
+        if job.status == PatchStatus.PR_CREATED and job.pr_url:
+            return {"pr_url": job.pr_url, "number": job.pr_number, "simulated": job.pr_simulated}
+        if job.status not in (
+            PatchStatus.VALIDATION_PASSED,
+            PatchStatus.DRY_RUN_PASSED,
+            PatchStatus.WAIT_FOR_APPROVAL,
+        ):
             raise ValueError(
                 f"Job {job_id} is in state '{job.status}' — "
                 "can only approve jobs in DRY_RUN_PASSED or WAIT_FOR_APPROVAL state"
@@ -200,6 +209,21 @@ async def approve_and_create_pr(job_id: str, actor: str = "on_call_engineer") ->
             raise ValueError(f"Job {job_id} has no stored patch to apply")
 
         unified_diff = job.unified_diff
+        claim = await db.execute(
+            update(RemediationJob)
+            .where(
+                RemediationJob.id == job_id,
+                RemediationJob.status.in_((
+                    PatchStatus.VALIDATION_PASSED,
+                    PatchStatus.DRY_RUN_PASSED,
+                    PatchStatus.WAIT_FOR_APPROVAL,
+                )),
+            )
+            .values(status=PatchStatus.APPROVING)
+        )
+        if claim.rowcount != 1:
+            raise ValueError(f"Job {job_id} is already being approved or has already produced a PR")
+        await db.commit()
 
     # ── TOCTOU Prevention: Re-verify dry-run against current repository HEAD ──
     try:
@@ -207,6 +231,7 @@ async def approve_and_create_pr(job_id: str, actor: str = "on_call_engineer") ->
             repo_root=settings.REPO_PATH,
             unified_diff=unified_diff,
             dry_run=True,
+            allowed_target=job.target_file,
         )
     except Exception as exc:
         error_msg = f"Re-verification dry-run failed (repo HEAD may have moved): {exc}"
@@ -276,7 +301,14 @@ async def _create_pr_for_job(
                 "and explicit human approval."
             ),
         )
-        await _update_status(job_id, PatchStatus.PR_CREATED)
+        async with AsyncSessionLocal() as db:
+            job = await db.get(RemediationJob, job_id)
+            if job:
+                job.pr_url = pr.get("pr_url") or pr.get("html_url")
+                job.pr_number = pr.get("number")
+                job.pr_simulated = bool(pr.get("simulated", False))
+                job.status = PatchStatus.PR_CREATED
+                await db.commit()
         await _record_audit(
             job_id, "PR_CREATED", actor=actor,
             details={"pr_url": pr.get("pr_url"), "pr_number": pr.get("number")},

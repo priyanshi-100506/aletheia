@@ -21,10 +21,12 @@ export type AuditLogEntry = {
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8001/api/v1'
+const API_KEY = import.meta.env.VITE_API_KEY
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   headers.set('Accept', 'application/json')
+  if (API_KEY) headers.set('X-API-Key', API_KEY)
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers })
   if (!response.ok) throw new Error(`API request failed: ${response.status}`)
   return response.json() as Promise<T>
@@ -46,19 +48,19 @@ export function ingestAlert(errorLog: string, targetFile?: string) {
   })
 }
 
-export function approveJob(jobId: string, actor = 'on_call_engineer') {
+export function approveJob(jobId: string) {
   return request<{ status: string; job_id: string; pull_request: any }>(`/jobs/${encodeURIComponent(jobId)}/approve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ actor }),
+    body: JSON.stringify({}),
   })
 }
 
-export function rejectJob(jobId: string, reason: string, actor = 'on_call_engineer') {
+export function rejectJob(jobId: string, reason: string) {
   return request<{ status: string; job_id: string }>(`/jobs/${encodeURIComponent(jobId)}/reject`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ reason, actor }),
+    body: JSON.stringify({ reason }),
   })
 }
 

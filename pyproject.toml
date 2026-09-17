@@ -33,6 +33,11 @@ dependencies = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = [
+    "aletheia: application and regression tests maintained by this repository",
+    "portfolio: intentionally failing portfolio demonstration fixtures",
+    "controlled_demo: intentionally failing tests in the external remediation target",
+]
 
 [tool.ruff]
 line-length = 100

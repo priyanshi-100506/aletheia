@@ -165,6 +165,18 @@ curl -X POST http://localhost:8001/api/v1/webhooks/ingest \
 
 ALETHEIA includes a comprehensive test suite with 100% mocked external I/O (no live database or Redis required for testing):
 
+### Test selection policy
+
+The application quality gate is `uv run pytest -m aletheia -q`. It selects every
+test under the root `tests/` directory and is the required green gate before a
+controlled E2E. It does not select intentionally broken fixtures.
+
+The other groups are intentionally not quality gates:
+
+- `uv run pytest -m portfolio -q` exercises the five broken portfolio fixtures; it is expected to fail before remediation.
+- `uv run pytest -m controlled_demo -q` exercises the checked-out `aletheia-demo-bugs` baseline; it is expected to report five failures at the supplied broken base SHA.
+- Unfiltered `uv run pytest -q` collects all three groups and therefore is expected to include those intentional failures.
+
 ```bash
 # Run pytest with short tracebacks
 uv run pytest tests/ -v --tb=short

@@ -1,5 +1,5 @@
 import pytest
-from api import parse_age
+from ..api import parse_age
 
 
 def test_negative_age_is_rejected():

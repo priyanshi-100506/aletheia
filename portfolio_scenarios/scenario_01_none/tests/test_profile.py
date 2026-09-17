@@ -1,5 +1,5 @@
 import pytest
-from profile import display_name
+from ..profile import display_name
 
 
 def test_missing_user_has_safe_display_name():

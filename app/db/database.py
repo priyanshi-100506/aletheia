@@ -95,10 +95,17 @@ async def init_db() -> None:
                 ))
             await conn.execute(text(
                 "ALTER TABLE remediation_jobs "
+                "ADD COLUMN IF NOT EXISTS target_test VARCHAR(256), "
+                "ADD COLUMN IF NOT EXISTS baseline_target_result TEXT, "
+                "ADD COLUMN IF NOT EXISTS postfix_target_result TEXT, "
+                "ADD COLUMN IF NOT EXISTS baseline_full_result TEXT, "
+                "ADD COLUMN IF NOT EXISTS postfix_full_result TEXT, "
+                "ADD COLUMN IF NOT EXISTS evidence_json TEXT, "
+                "ADD COLUMN IF NOT EXISTS repository VARCHAR(512), "
+                "ADD COLUMN IF NOT EXISTS base_sha VARCHAR(64), "
                 "ADD COLUMN IF NOT EXISTS pr_url VARCHAR(1024), "
                 "ADD COLUMN IF NOT EXISTS pr_number INTEGER, "
-                "ADD COLUMN IF NOT EXISTS pr_simulated BOOLEAN NOT NULL DEFAULT FALSE, "
-                "ADD COLUMN IF NOT EXISTS base_sha VARCHAR(64)"
+                "ADD COLUMN IF NOT EXISTS pr_simulated BOOLEAN NOT NULL DEFAULT FALSE"
             ))
 
 

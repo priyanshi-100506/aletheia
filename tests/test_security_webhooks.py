@@ -176,14 +176,12 @@ def test_checked_out_target_materializes_base_sha(tmp_path, monkeypatch):
     asyncio.run(run_test())
 
 
-def test_patcher_prompt_includes_line_numbers():
-    """Verify target file source context provided to LLM includes 1-indexed line numbers."""
-    sample_code = "def foo():\n    return 42"
-    numbered_source = "\n".join(
-        f"{idx:3d} | {line}" for idx, line in enumerate(sample_code.splitlines(), start=1)
-    )
-    assert "  1 | def foo():" in numbered_source
-    assert "  2 |     return 42" in numbered_source
+def test_patcher_system_instruction_demands_strict_diff_hunks():
+    """Verify system instruction contains strict requirements for diff headers and context lines."""
+    from app.services.patcher import SYSTEM_INSTRUCTION
+
+    assert "CRITICAL UNIFIED DIFF REQUIREMENTS" in SYSTEM_INSTRUCTION
+    assert "--- a/<target_file_path>" in SYSTEM_INSTRUCTION
 
 def test_sanitize_diff_normalizes_header_paths():
     """Verify sanitize_diff normalizes header paths missing a/ and b/ prefixes."""

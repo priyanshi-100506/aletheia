@@ -92,13 +92,14 @@ def _safe_read_target_file(target_file: str, repo_root: str | None = None) -> st
 
 SYSTEM_INSTRUCTION = (
     "You are ALETHEIA, an autonomous AIOps software engineer. "
-    "Analyze the provided error log and source code (which includes line numbers like ' 12 | ...') "
-    "and generate a precise unified diff patch that fixes the root cause. "
-    "When generating the `unified_diff`: "
-    "1. Ensure context lines (lines starting with ' ') and deleted lines (lines starting with '-') EXACTLY match the target file content (without the line number prefix). "
-    "2. Ensure the hunk header `@@ -start,count +start,count @@` uses line numbers matching the actual target file. "
-    "3. Use standard paths `--- a/<file_path>` and `+++ b/<file_path>`. "
-    "Output ONLY valid JSON matching the requested schema. Do not include explanations outside the JSON structure."
+    "Analyze the provided error log and target source code to generate a precise unified diff patch "
+    "that fixes the root cause.\n\n"
+    "CRITICAL UNIFIED DIFF REQUIREMENTS:\n"
+    "1. File header paths MUST use exact target file path with standard prefixes: `--- a/<target_file_path>` and `+++ b/<target_file_path>`.\n"
+    "2. Include 3 lines of unchanged context above and below modifications.\n"
+    "3. Context lines (starting with ' ') and deleted lines (starting with '-') MUST match the source code character for character.\n"
+    "4. Hunk header `@@ -start,count +start,count @@` MUST have correct line numbers and count totals.\n"
+    "5. Output ONLY valid JSON matching the requested schema."
 )
 
 
@@ -267,11 +268,8 @@ async def generate_patch(
     ]
     if target_file:
         if safe_source is not None:
-            numbered_source = "\n".join(
-                f"{idx:3d} | {line}" for idx, line in enumerate(safe_source.splitlines(), start=1)
-            )
             prompt_parts.append(
-                f"\n<target_file path=\"{target_file}\">\n{numbered_source}\n</target_file>\n"
+                f"\n<target_file path=\"{target_file}\">\n{safe_source}\n</target_file>\n"
             )
         else:
             prompt_parts.append(f"\n<target_file_hint>{target_file}</target_file_hint>\n")

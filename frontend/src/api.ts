@@ -7,6 +7,7 @@ export type BackendJob = {
   explanation: string | null
   unified_diff: string | null
   confidence_score: number | null
+  pr_simulated?: boolean
   created_at: string
   updated_at: string
 }
@@ -28,7 +29,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   headers.set('Accept', 'application/json')
   if (API_KEY) headers.set('X-API-Key', API_KEY)
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers })
-  if (!response.ok) throw new Error(`API request failed: ${response.status}`)
+  if (!response.ok) {
+    let detail = ''
+    try {
+      const body = await response.json() as { detail?: string }
+      detail = body.detail ? `: ${body.detail}` : ''
+    } catch {
+      // Keep the status as the fallback when the server did not return JSON.
+    }
+    throw new Error(`API request failed: ${response.status}${detail}`)
+  }
   return response.json() as Promise<T>
 }
 

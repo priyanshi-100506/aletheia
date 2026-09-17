@@ -26,6 +26,9 @@ import logging
 import os
 
 from arq.connections import RedisSettings
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from app.services.orchestrator import process_remediation_job
 from app.services.queue_service import get_redis_settings

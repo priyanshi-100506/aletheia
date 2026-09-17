@@ -64,6 +64,17 @@ class RemediationJob(Base):
     unified_diff: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Additional fields for deterministic test handling and evidence
+    target_test: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    baseline_target_result: Mapped[Text] = mapped_column(Text, nullable=True)
+    postfix_target_result: Mapped[Text] = mapped_column(Text, nullable=True)
+    baseline_full_result: Mapped[Text] = mapped_column(Text, nullable=True)
+    postfix_full_result: Mapped[Text] = mapped_column(Text, nullable=True)
+    evidence_json: Mapped[Text] = mapped_column(Text, nullable=True)
+    # Repository from incident payload
+    repository: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    base_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     # Lifecycle
     status: Mapped[PatchStatus] = mapped_column(
         Enum(PatchStatus), default=PatchStatus.PENDING, nullable=False, index=True

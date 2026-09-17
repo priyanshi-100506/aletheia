@@ -8,7 +8,7 @@ import { Repositories } from './components/Repositories'
 import { Settings } from './components/Settings'
 import { AlertIngestModal } from './components/AlertIngestModal'
 
-type Status = 'Review' | 'Generating' | 'Validated' | 'PR created' | 'Failed'
+type Status = 'Review' | 'Generating' | 'Validated' | 'PR created' | 'PR simulated' | 'Failed'
 type Incident = {
   id: string
   rawJobId: string
@@ -33,7 +33,7 @@ const demoIncidents: Incident[] = [
 ]
 
 function StatusIcon({ status }: { status: Status }) {
-  if (status === 'Validated' || status === 'PR created') return <CheckCircle2 size={15} />
+  if (status === 'Validated' || status === 'PR created' || status === 'PR simulated') return <CheckCircle2 size={15} />
   if (status === 'Failed') return <AlertTriangle size={15} />
   if (status === 'Generating') return <CircleDashed size={15} />
   return <Clock3 size={15} />
@@ -56,7 +56,7 @@ function toIncident(job: BackendJob): Incident {
     VALIDATION_PASSED: 'Validated',
     VALIDATION_FAILED: 'Failed',
     DRY_RUN_PASSED: 'Validated',
-    PR_CREATED: 'PR created',
+    PR_CREATED: job.pr_simulated ? 'PR simulated' : 'PR created',
     FAILED: 'Failed',
   }
   const status = statusMap[job.status] ?? 'Review'
@@ -398,7 +398,7 @@ export function App() {
                 ['Alert received', 'done', selected.age + ' ago'],
                 ['Patch analysis', selected.status !== 'Generating' ? 'done' : 'current', selected.status === 'Generating' ? 'Running now' : 'Completed'],
                 ['Dry-run validation', selected.status === 'Validated' || selected.status === 'PR created' ? 'done' : '', selected.status === 'Validated' || selected.status === 'PR created' ? 'Passed cleanly' : 'Waiting'],
-                ['Pull request', selected.status === 'PR created' ? 'done' : '', selected.status === 'PR created' ? 'Open on GitHub' : 'Approval required'],
+                ['Pull request', selected.status === 'PR created' || selected.status === 'PR simulated' ? 'done' : '', selected.status === 'PR created' ? 'Open on GitHub' : selected.status === 'PR simulated' ? 'Demo result; no GitHub PR created' : 'Approval required'],
               ].map(([label, state, time]) => (
                 <div className={`timeline-item ${state}`} key={label}>
                   <span>{state === 'done' ? <Check size={12} /> : state === 'current' ? <CircleDashed size={13} /> : <Terminal size={13} />}</span>

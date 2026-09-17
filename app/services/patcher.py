@@ -42,7 +42,7 @@ _SENSITIVE_PATTERNS = {
 }
 
 
-def _safe_read_target_file(target_file: str) -> str | None:
+def _safe_read_target_file(target_file: str, repo_root: str | None = None) -> str | None:
     """Read a target file safely within repository boundaries.
 
     Ensures the path does not traverse outside `settings.REPO_PATH` and
@@ -50,7 +50,7 @@ def _safe_read_target_file(target_file: str) -> str | None:
     the LLM context.
     """
     try:
-        repo_root = Path(settings.REPO_PATH).resolve()
+        repo_root = Path(repo_root or settings.REPO_PATH).resolve()
         candidate = Path(target_file)
         if not candidate.is_absolute():
             candidate = (repo_root / candidate).resolve()
@@ -98,6 +98,50 @@ SYSTEM_INSTRUCTION = (
 )
 
 
+def _demo_patch(error_log: str, target_file: str | None) -> PatchResult:
+    if target_file in ("incident_demo/services/users.py", "incident-demo/services/users.py", "users.py"):
+        return PatchResult(
+            file_path="incident_demo/services/users.py",
+            bug_description="Requests for users without a configured display name fail with AttributeError when calling upper() on None.",
+            explanation="Check if display_name is not None before calling .upper(), defaulting to a fallback string or None.",
+            unified_diff=(
+                "--- a/incident_demo/services/users.py\n"
+                "+++ b/incident_demo/services/users.py\n"
+                "@@ -11,4 +11,6 @@\n"
+                " def get_display_name(db: Session, user_id: int) -> str:\n"
+                "     user = get_user(db, user_id)\n"
+                "     # Intentionally buggy handling: calling .strip() directly on display_name without checking for None\n"
+                "-    return user.display_name.strip()\n"
+                "+    if user.display_name is None:\n"
+                "+        return user.username\n"
+                "+    return user.display_name.strip()\n"
+            ),
+            confidence_score=0.99,
+        )
+    if target_file == "transaction_service.py":
+        return PatchResult(
+            file_path=target_file,
+            bug_description="A missing discount tier can cause a NoneType or division error during fee calculation.",
+            explanation="Return the base fee when the discount tier is missing or zero before dividing.",
+            unified_diff=(
+                "--- a/transaction_service.py\n"
+                "+++ b/transaction_service.py\n"
+                "@@ -1,3 +1,5 @@\n"
+                " def calculate_transaction_fee(amount, discount_tier):\n"
+                "     fee = amount * 0.02\n"
+                "-    return fee / discount_tier\n"
+                "+    if not discount_tier:\n"
+                "+        return fee\n"
+                "+    return fee / discount_tier\n"
+            ),
+            confidence_score=0.98,
+        )
+    raise ValueError(
+        f"No deterministic demo fixture exists for {target_file or 'the requested target'}. "
+        "Set DEMO_MODE=false to use Gemini for this incident."
+    )
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """Return True for API errors that are worth retrying."""
     msg = str(exc)
@@ -136,6 +180,7 @@ async def generate_patch(
     error_log: str,
     target_file: str | None = None,
     job_id: str | None = None,
+    repo_root: str | None = None,
 ) -> tuple[PatchResult, RemediationJob]:
     """Generate a patch for the given error log using Gemini AI.
 
@@ -156,6 +201,27 @@ async def generate_patch(
         ValueError: If GEMINI_API_KEY is not set.
         Exception:  Any non-retried Gemini API or validation error.
     """
+    if settings.DEMO_MODE:
+        patch_data = _demo_patch(error_log, target_file)
+        job = await db.get(RemediationJob, job_id) if job_id else None
+        if job is None:
+            job = RemediationJob(
+                id=job_id or str(uuid.uuid4()),
+                error_log=error_log,
+                target_file=target_file,
+                status=PatchStatus.PENDING,
+            )
+            db.add(job)
+        job.target_file = patch_data.file_path
+        job.bug_description = patch_data.bug_description
+        job.explanation = patch_data.explanation
+        job.unified_diff = patch_data.unified_diff
+        job.confidence_score = patch_data.confidence_score
+        job.status = PatchStatus.GENERATED
+        await db.commit()
+        await db.refresh(job)
+        return patch_data, job
+
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise ValueError(
@@ -189,7 +255,7 @@ async def generate_patch(
     # ── Build prompt safely ───────────────────────────────────────────────────
     safe_source: str | None = None
     if target_file:
-        safe_source = _safe_read_target_file(target_file)
+        safe_source = _safe_read_target_file(target_file, repo_root)
 
     prompt_parts = [
         "Analyze the following incident report and produce a precise unified diff patch.\n\n",

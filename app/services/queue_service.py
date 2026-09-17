@@ -9,14 +9,19 @@ import logging
 from typing import Optional
 
 import redis.asyncio as aioredis
-from arq import ArqRedis, create_pool
-from arq.connections import RedisSettings
+try:
+    from arq import ArqRedis, create_pool
+    from arq.connections import RedisSettings
+except ImportError:
+    ArqRedis = None
+    create_pool = None
+    RedisSettings = None
 
 from app.config import settings
 
 logger = logging.getLogger("aletheia")
 
-_arq_pool: Optional[ArqRedis] = None
+_arq_pool = None
 
 
 def get_redis_settings() -> RedisSettings:

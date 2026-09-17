@@ -13,6 +13,7 @@ import os
 import logging
 from typing import AsyncGenerator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -81,6 +82,24 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if conn.dialect.name == "postgresql":
+            for status in (
+                "PATCH_APPLIED",
+                "VALIDATION_PASSED",
+                "VALIDATION_FAILED",
+                "WAIT_FOR_APPROVAL",
+                "APPROVING",
+            ):
+                await conn.execute(text(
+                    f"ALTER TYPE patchstatus ADD VALUE IF NOT EXISTS '{status}'"
+                ))
+            await conn.execute(text(
+                "ALTER TABLE remediation_jobs "
+                "ADD COLUMN IF NOT EXISTS pr_url VARCHAR(1024), "
+                "ADD COLUMN IF NOT EXISTS pr_number INTEGER, "
+                "ADD COLUMN IF NOT EXISTS pr_simulated BOOLEAN NOT NULL DEFAULT FALSE, "
+                "ADD COLUMN IF NOT EXISTS base_sha VARCHAR(64)"
+            ))
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

@@ -49,12 +49,19 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_JOBS: int = 4
 
     # ── CORS ──────────────────────────────────────────────────────────────────
-    FRONTEND_ORIGINS: str = "http://127.0.0.1:5174,http://localhost:5174"
+    FRONTEND_ORIGINS: str = (
+        "http://127.0.0.1:5173,http://localhost:5173,"
+        "http://127.0.0.1:5174,http://localhost:5174"
+    )
 
     # ── Runtime ───────────────────────────────────────────────────────────────
     # Demo mode is an explicit local-only opt-in. Protected mode is the default.
     ENVIRONMENT: str = "development"
     DEMO_MODE: bool = False
+
+    # ── Demo Configuration ────────────────────────────────────────────────────
+    ALLOWED_REPOS: list[str] = ["priyanshi-100506/aletheia-demo-bugs"]
+    REPO_SIZE_LIMIT_BYTES: int = 50_000_000
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

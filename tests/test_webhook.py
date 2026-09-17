@@ -7,6 +7,8 @@ Tests use pure in-process function calls via asyncio.run() where possible,
 or the session-scoped `client` fixture for endpoint-level tests.
 """
 import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from app.schemas.patch import PatchResult
@@ -90,14 +92,27 @@ def _make_patch() -> PatchResult:
     )
 
 
+@asynccontextmanager
+async def _fake_target_checkout(*_args, **_kwargs):
+    """Keep orchestration tests offline while asserting target checkout usage."""
+    yield Path(".").resolve()
+
+
+async def _fake_validation(*_args, **_kwargs):
+    return {
+        "baseline_target_result": "{}", "postfix_target_result": "{}",
+        "baseline_full_result": "{}", "postfix_full_result": "{}", "evidence_json": "{}",
+    }
+
+
 def test_orchestrator_full_pipeline_auto_approve(monkeypatch):
     """Full happy-path pipeline with auto_approve=True must create a PR."""
     job_id = "test-job-001"
-    job = RemediationJob(id=job_id, error_log="error", status=PatchStatus.PENDING)
+    job = RemediationJob(id=job_id, error_log="error", repository="priyanshi-100506/aletheia-demo-bugs", target_test="tests/test_users.py::test_display_name_none", status=PatchStatus.PENDING)
     session = _FakeSession(job)
     patch = _make_patch()
 
-    async def fake_generate(db, error_log, target_file, job_id):
+    async def fake_generate(db, error_log, target_file, job_id, repo_root=None):
         return patch, job
 
     async def fake_dry_run(*args, **kwargs):
@@ -111,6 +126,8 @@ def test_orchestrator_full_pipeline_auto_approve(monkeypatch):
     monkeypatch.setattr(orchestrator, "apply_unified_diff", fake_dry_run)
     monkeypatch.setattr(orchestrator, "validate_in_isolated_workspace", fake_dry_run)
     monkeypatch.setattr(orchestrator, "create_pull_request", fake_pr)
+    monkeypatch.setattr(orchestrator, "checked_out_target", _fake_target_checkout)
+    monkeypatch.setattr(orchestrator, "run_isolated_validation_pipeline", _fake_validation)
 
     ctx = {}  # ARQ context (not used in tests)
     result = asyncio.run(
@@ -125,11 +142,11 @@ def test_orchestrator_full_pipeline_auto_approve(monkeypatch):
 def test_orchestrator_awaits_approval_when_auto_approve_false(monkeypatch):
     """Pipeline with auto_approve=False must stop at WAIT_FOR_APPROVAL."""
     job_id = "test-job-002"
-    job = RemediationJob(id=job_id, error_log="error", status=PatchStatus.PENDING)
+    job = RemediationJob(id=job_id, error_log="error", repository="priyanshi-100506/aletheia-demo-bugs", target_test="tests/test_users.py::test_display_name_none", status=PatchStatus.PENDING)
     session = _FakeSession(job)
     patch = _make_patch()
 
-    async def fake_generate(db, error_log, target_file, job_id):
+    async def fake_generate(db, error_log, target_file, job_id, repo_root=None):
         return patch, job
 
     async def fake_dry_run(*args, **kwargs):
@@ -139,6 +156,8 @@ def test_orchestrator_awaits_approval_when_auto_approve_false(monkeypatch):
     monkeypatch.setattr(orchestrator, "generate_patch", fake_generate)
     monkeypatch.setattr(orchestrator, "apply_unified_diff", fake_dry_run)
     monkeypatch.setattr(orchestrator, "validate_in_isolated_workspace", fake_dry_run)
+    monkeypatch.setattr(orchestrator, "checked_out_target", _fake_target_checkout)
+    monkeypatch.setattr(orchestrator, "run_isolated_validation_pipeline", _fake_validation)
 
     ctx = {}
     result = asyncio.run(
@@ -152,7 +171,7 @@ def test_orchestrator_awaits_approval_when_auto_approve_false(monkeypatch):
 def test_orchestrator_marks_failed_on_generate_error(monkeypatch):
     """A Gemini API failure must mark the job FAILED and return error dict."""
     job_id = "test-job-003"
-    job = RemediationJob(id=job_id, error_log="error", status=PatchStatus.PENDING)
+    job = RemediationJob(id=job_id, error_log="error", repository="priyanshi-100506/aletheia-demo-bugs", target_test="tests/test_users.py::test_display_name_none", status=PatchStatus.PENDING)
     session = _FakeSession(job)
 
     async def failing_generate(*args, **kwargs):
@@ -160,6 +179,7 @@ def test_orchestrator_marks_failed_on_generate_error(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "AsyncSessionLocal", _SessionFactory(session))
     monkeypatch.setattr(orchestrator, "generate_patch", failing_generate)
+    monkeypatch.setattr(orchestrator, "checked_out_target", _fake_target_checkout)
 
     ctx = {}
     result = asyncio.run(
@@ -174,11 +194,11 @@ def test_orchestrator_marks_failed_on_generate_error(monkeypatch):
 def test_orchestrator_marks_failed_on_dry_run_error(monkeypatch):
     """A dry-run failure must mark the job FAILED and return error dict."""
     job_id = "test-job-004"
-    job = RemediationJob(id=job_id, error_log="error", status=PatchStatus.PENDING)
+    job = RemediationJob(id=job_id, error_log="error", repository="priyanshi-100506/aletheia-demo-bugs", target_test="tests/test_users.py::test_display_name_none", status=PatchStatus.PENDING)
     session = _FakeSession(job)
     patch = _make_patch()
 
-    async def fake_generate(db, error_log, target_file, job_id):
+    async def fake_generate(db, error_log, target_file, job_id, repo_root=None):
         return patch, job
 
     async def failing_dry_run(*args, **kwargs):
@@ -187,6 +207,10 @@ def test_orchestrator_marks_failed_on_dry_run_error(monkeypatch):
     monkeypatch.setattr(orchestrator, "AsyncSessionLocal", _SessionFactory(session))
     monkeypatch.setattr(orchestrator, "generate_patch", fake_generate)
     monkeypatch.setattr(orchestrator, "validate_in_isolated_workspace", failing_dry_run)
+    monkeypatch.setattr(orchestrator, "checked_out_target", _fake_target_checkout)
+    async def failing_validation(*args, **kwargs):
+        raise RuntimeError("patch conflict on line 12")
+    monkeypatch.setattr(orchestrator, "run_isolated_validation_pipeline", failing_validation)
 
     ctx = {}
     result = asyncio.run(

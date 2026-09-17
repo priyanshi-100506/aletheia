@@ -202,6 +202,39 @@ The runner uses deterministic fixture patches, so these commands make zero Gemin
 
 Protected mode is the default: set `API_KEY` and `WEBHOOK_SECRET`; missing credentials are rejected. For an explicitly local demonstration only, set `DEMO_MODE=true` with a non-production `ENVIRONMENT`. The frontend reads `VITE_API_KEY` and sends it as `X-API-Key` when configured.
 
+### 🧪 Controlled Demo Run (ALETHEIA vs. Demo Bugs)
+
+ALETHEIA includes a deterministic test suite and incident ingestion endpoint specifically wired for [`aletheia-demo-bugs`](https://github.com/priyanshi-100506/aletheia-demo-bugs).
+
+Repository identity is part of the incident contract. ALETHEIA clones the
+allowlisted `repository` into a new temporary checkout pinned to `base_sha`;
+source context, validation, approval re-check, branch push, and PR verification
+all use that checkout. `GITHUB_REPOSITORY` is not used as a fallback target.
+
+1. **Verify Demo Repository Baseline (5 intentional bugs):**
+   ```powershell
+   .\scripts\verify_demo.ps1
+   ```
+
+2. **Ingest an Incident:**
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/incidents \
+     -H "Content-Type: application/json" \
+     -d '{
+       "repository": "priyanshi-100506/aletheia-demo-bugs",
+       "base_sha": "0606c8c56c0f0319cf07d823adafa2be3aebbba6",
+       "scenario": "scenario_1",
+       "error_log": "AttributeError: NoneType object has no attribute upper in get_user_display_name"
+     }'
+   ```
+
+3. **Pipeline Execution:**
+   - Evaluates baseline target failure (`test_users.py::test_display_name_none`).
+   - Clones the incident repository at its requested base SHA, then generates and applies a unified patch in an isolated workspace.
+   - Re-tests target scenario (must pass).
+   - Runs full regression suite to guarantee no unintentional breaks.
+   - Requires operator approval before opening a PR (or simulates in `DEMO_MODE=true`). A real result is persisted only after GitHub verifies the repository, branch, commit, and PR fields; failures fail closed.
+
 ---
 
 ## 📁 Repository Structure

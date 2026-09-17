@@ -26,9 +26,11 @@ from app.db.database import AsyncSessionLocal
 from app.models.audit import AuditLog
 from app.models.remediation import PatchStatus, RemediationJob
 from app.services.git_applier import apply_unified_diff, validate_in_isolated_workspace
+from app.services.patch_validation import run_isolated_validation_pipeline
 from app.services.github_service import create_pull_request
 from app.services.patcher import generate_patch
 from app.config import settings
+from app.services.target_repository import checked_out_target
 
 logger = logging.getLogger("aletheia")
 
@@ -122,48 +124,57 @@ async def process_remediation_job(
     async with _job_semaphore:
         await _record_audit(job_id, "PIPELINE_STARTED", details={"target_file": target_file})
 
-        # ── Stage 1: Generate patch via Gemini ────────────────────────────────
-        try:
-            await _update_status(job_id, PatchStatus.GENERATING)
+        async with AsyncSessionLocal() as db:
+            incident = await db.get(RemediationJob, job_id)
+            if incident is None or not incident.repository:
+                error_msg = "Job has no authoritative incident repository"
+                await _update_status(job_id, PatchStatus.FAILED, error=error_msg)
+                return {"status": "failed", "error": error_msg}
+            incident_repo, base_sha = incident.repository, incident.base_sha
 
-            async with AsyncSessionLocal() as db:
-                patch, job = await generate_patch(
-                    db=db,
-                    error_log=error_log,
-                    target_file=target_file,
-                    job_id=job_id,
+        generated = False
+        try:
+            # This checkout is the sole source for LLM context and validation.
+            # It is intentionally never the ALETHEIA application checkout.
+            async with checked_out_target(incident_repo, base_sha) as target_checkout:
+                # ── Stage 1: Generate patch via Gemini ────────────────────────
+                await _update_status(job_id, PatchStatus.GENERATING)
+
+                async with AsyncSessionLocal() as db:
+                    patch, job = await generate_patch(
+                        db=db, error_log=error_log, target_file=target_file,
+                        job_id=job_id, repo_root=str(target_checkout),
+                    )
+
+                await _record_audit(job_id, "PATCH_GENERATED", details={"confidence": patch.confidence_score, "file_path": patch.file_path})
+                generated = True
+
+                # ── Stage 2: Validation ───────────────────────────────────────
+                target_test_to_run = job.target_test if job else None
+
+                if not target_test_to_run:
+                    raise ValueError("A controlled incident requires a target test")
+                val_res = await run_isolated_validation_pipeline(
+                    repo_source=str(target_checkout), unified_diff=patch.unified_diff,
+                    target_test=target_test_to_run, target_file=target_file,
                 )
-
-            await _record_audit(
-                job_id, "PATCH_GENERATED",
-                details={
-                    "confidence": patch.confidence_score,
-                    "file_path": patch.file_path,
-                },
-            )
+                async with AsyncSessionLocal() as db:
+                    loaded_job = await db.get(RemediationJob, job_id)
+                    if loaded_job:
+                        loaded_job.baseline_target_result = val_res.get("baseline_target_result")
+                        loaded_job.postfix_target_result = val_res.get("postfix_target_result")
+                        loaded_job.baseline_full_result = val_res.get("baseline_full_result")
+                        loaded_job.postfix_full_result = val_res.get("postfix_full_result")
+                        loaded_job.evidence_json = val_res.get("evidence_json")
+                        loaded_job.status = PatchStatus.VALIDATION_PASSED
+                        await db.commit()
+                await _record_audit(job_id, "VALIDATION_PASSED", details={"checks": ["isolated_pytest", "regression_suite"], "target_test": target_test_to_run})
         except Exception as exc:
             error_msg = str(exc)
-            logger.error("Patch generation failed for job %s: %s", job_id, error_msg)
-            await _update_status(job_id, PatchStatus.FAILED, error=error_msg)
-            await _record_audit(job_id, "PIPELINE_FAILED", details={"stage": "generate", "error": error_msg})
-            return {"status": "failed", "error": error_msg}
-
-        # ── Stage 2: Dry-run validation ───────────────────────────────────────
-        try:
-            await validate_in_isolated_workspace(
-                repo_root=settings.REPO_PATH,
-                unified_diff=patch.unified_diff,
-                allowed_target=patch.file_path,
-            )
-            await _update_status(job_id, PatchStatus.PATCH_APPLIED)
-            await _update_status(job_id, PatchStatus.VALIDATION_PASSED)
-            await _record_audit(job_id, "PATCH_APPLIED")
-            await _record_audit(job_id, "VALIDATION_PASSED", details={"checks": ["git_apply", "py_compile"]})
-        except Exception as exc:
-            error_msg = str(exc)
-            logger.error("Dry-run validation failed for job %s: %s", job_id, error_msg)
-            await _update_status(job_id, PatchStatus.VALIDATION_FAILED, error=error_msg)
-            await _record_audit(job_id, "PIPELINE_FAILED", details={"stage": "dry_run", "error": error_msg})
+            logger.error("Generation or validation failed for job %s: %s", job_id, error_msg)
+            failed_stage = "validation" if generated else "generate"
+            await _update_status(job_id, PatchStatus.VALIDATION_FAILED if generated else PatchStatus.FAILED, error=error_msg)
+            await _record_audit(job_id, "PIPELINE_FAILED", details={"stage": failed_stage, "error": error_msg})
             return {"status": "failed", "error": error_msg}
 
         # ── Stage 3a: Human approval gate (default) ───────────────────────────
@@ -225,14 +236,15 @@ async def approve_and_create_pr(job_id: str, actor: str = "on_call_engineer") ->
             raise ValueError(f"Job {job_id} is already being approved or has already produced a PR")
         await db.commit()
 
-    # ── TOCTOU Prevention: Re-verify dry-run against current repository HEAD ──
+    # ── TOCTOU Prevention: re-verify against the authoritative target checkout ──
     try:
-        await apply_unified_diff(
-            repo_root=settings.REPO_PATH,
-            unified_diff=unified_diff,
-            dry_run=True,
-            allowed_target=job.target_file,
-        )
+        if not job.repository:
+            raise ValueError("Job has no authoritative incident repository")
+        async with checked_out_target(job.repository, job.base_sha) as target_checkout:
+            await apply_unified_diff(
+                repo_root=str(target_checkout), unified_diff=unified_diff, dry_run=True,
+                allowed_target=job.target_file, _allow_external_repo=True,
+            )
     except Exception as exc:
         error_msg = f"Re-verification dry-run failed (repo HEAD may have moved): {exc}"
         logger.error("Approval aborted for job %s: %s", job_id, error_msg)
@@ -288,19 +300,24 @@ async def _create_pr_for_job(
     This function is shared between auto-approve and human-approval flows.
     """
     try:
-        pr = await create_pull_request(
-            repo_path=settings.REPO_PATH,
-            branch_name=job_id,
-            patch_diff=unified_diff,
-            pr_title=f"fix(autofix): resolve incident {job_id[:8]}",
-            pr_body=(
-                f"Automated remediation patch generated by ALETHEIA.\n\n"
-                f"**Job ID:** `{job_id}`\n"
-                f"**Approved by:** {actor}\n\n"
-                "This PR was created automatically after passing dry-run validation "
-                "and explicit human approval."
-            ),
-        )
+        # Retrieve the job to obtain the incident repository
+        async with AsyncSessionLocal() as db:
+            job_record = await db.get(RemediationJob, job_id)
+            if not job_record:
+                raise ValueError(f"Job {job_id} not found when creating PR")
+            incident_repo, base_sha = job_record.repository, job_record.base_sha
+            if not incident_repo:
+                raise ValueError("Job has no authoritative incident repository")
+
+        async with checked_out_target(incident_repo, base_sha) as target_checkout:
+            pr = await create_pull_request(
+                repo_path=str(target_checkout), branch_name=job_id, patch_diff=unified_diff,
+                pr_title=f"fix(autofix): resolve incident {job_id[:8]}",
+                pr_body=(f"Automated remediation patch generated by ALETHEIA.\n\n"
+                         f"**Job ID:** `{job_id}`\n**Approved by:** {actor}\n\n"
+                         "This PR was created automatically after passing validation and explicit human approval."),
+                incident_repo=incident_repo, base_sha=base_sha,
+            )
         async with AsyncSessionLocal() as db:
             job = await db.get(RemediationJob, job_id)
             if job:

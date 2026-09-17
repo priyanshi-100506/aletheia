@@ -4,7 +4,6 @@ import os
 import re
 import subprocess
 import tempfile
-from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -39,25 +38,57 @@ def _git(repo_path: str, *args: str, token: str | None = None) -> str:
     return result.stdout.strip()
 
 
+def _canonical_repo(repo: str) -> str:
+    """Normalize repository identifiers to the canonical 'owner/repo' form.
+    Supports:
+        - owner/repo
+        - https://github.com/owner/repo.git
+        - git@github.com:owner/repo.git
+        - trailing slashes and .git suffixes
+    """
+    repo = repo.strip()
+    if "://" in repo:
+        # URL form
+        parsed = urlparse(repo)
+        repo = parsed.path
+    elif repo.startswith("git@"):
+        repo = repo.split(":", 1)[-1]
+    repo = repo.lstrip('/')
+    repo = repo.removesuffix('.git').strip('/')
+    return repo
+
+
 async def create_pull_request(
+    *,
     repo_path: str,
     branch_name: str,
     patch_diff: str,
     pr_title: str,
     pr_body: str,
+    incident_repo: str,
+    base_sha: str | None = None,
 ) -> dict:
+    """Create a PR after ensuring the Git remote matches the incident repository.
+    Steps:
+    1. Verify local remote matches incident_repo.
+    2. Push the branch (unless in demo mode).
+    3. POST to GitHub to create the PR.
+    4. GET the PR to verify its existence.
+    """
     repository_path = _repository_path(repo_path)
     branch = branch_name if branch_name.startswith("fix/aletheia-") else f"fix/aletheia-{branch_name}"
     if len(patch_diff) > settings.MAX_PATCH_LENGTH:
         raise ValueError("Patch exceeds the maximum allowed size")
 
     token = os.getenv("GITHUB_TOKEN", settings.GITHUB_TOKEN)
-    target_repo = os.getenv("GITHUB_REPOSITORY", settings.GITHUB_REPOSITORY)
     base_branch = os.getenv("GITHUB_BASE_BRANCH", settings.GITHUB_BASE_BRANCH)
 
-    if not token:
-        logger.warning(
-            "[GITHUB PR SIMULATION] GITHUB_TOKEN not set. Simulating PR creation for branch %s",
+    # Demo mode – simulate without side effects
+    if settings.DEMO_MODE or not token:
+        logger.info(
+            "[GITHUB PR SIMULATION] DEMO MODE — NO REAL PR CREATED (DEMO_MODE=%s, token_present=%s, branch=%s)",
+            settings.DEMO_MODE,
+            bool(token),
             branch,
         )
         return {
@@ -65,30 +96,47 @@ async def create_pull_request(
             "html_url": None,
             "number": None,
             "simulated": True,
-            "mode": "DEMO MODE - NO REAL PR CREATED",
+            "mode": "DEMO MODE — NO REAL PR CREATED",
         }
 
-    remote = await asyncio.to_thread(_git, str(repository_path), "remote", "get-url", "origin")
+    # Verify remote matches the incident repository (canonical form)
+    remote_url = await asyncio.to_thread(_git, str(repository_path), "remote", "get-url", "origin")
+    remote_canonical = _canonical_repo(remote_url)
+    incident_canonical = _canonical_repo(incident_repo)
+    if remote_canonical != incident_canonical:
+        raise RuntimeError(
+            f"Git remote origin ({remote_canonical}) does not match incident repository ({incident_canonical})"
+        )
+    head_sha = await asyncio.to_thread(_git, str(repository_path), "rev-parse", "HEAD")
+    if base_sha and head_sha.lower() != base_sha.lower():
+        raise RuntimeError("Target checkout HEAD does not match the incident base SHA")
 
-    repository = target_repo or remote
-    if "://" in repository:
-        repository = urlparse(repository).path
-    else:
-        repository = repository.split(":", 1)[-1]
-    repository = repository.strip("/").removesuffix(".git")
-    url = f"https://api.github.com/repos/{repository}/pulls"
+    api_repo = incident_canonical
+    url = f"https://api.github.com/repos/{api_repo}/pulls"
     timeout = httpx.Timeout(15.0, connect=5.0)
+
+    # Check for existing PRs first
     async with httpx.AsyncClient(timeout=timeout) as client:
         existing = await client.get(
             url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-            params={"head": f"{repository.split('/')[-2]}:{branch}", "base": base_branch, "state": "all"},
+            params={"head": f"{api_repo.split('/')[-1]}:{branch}", "base": base_branch, "state": "all"},
         )
-        if existing.status_code < 400 and existing.json():
+        if existing.status_code >= 400:
+            sanitized = _sanitize_output(existing.text, token)
+            raise RuntimeError(f"GitHub API Error {existing.status_code}: {sanitized}")
+        if existing.json():
             data = existing.json()[0]
+            if (
+                _canonical_repo(data.get("base", {}).get("repo", {}).get("full_name", "")) != incident_canonical
+                or data.get("head", {}).get("ref") != branch
+                or data.get("base", {}).get("ref") != base_branch
+            ):
+                raise RuntimeError("Existing PR did not match the approved target and branch")
             return {"pr_url": data["html_url"], "url": data["html_url"], "number": data.get("number"), "data": data, "reused": True}
 
-    # 1. Create worktree, apply patch, commit & push branch to remote
+    # Create worktree, apply patch, commit and push
+    pushed_commit_sha = ""
     with tempfile.TemporaryDirectory(prefix="aletheia-worktree-") as worktree:
         await asyncio.to_thread(_git, str(repository_path), "worktree", "add", "--detach", worktree, "HEAD")
         try:
@@ -111,31 +159,79 @@ async def create_pull_request(
                 _git, worktree, "commit", "-m", f"fix(autofix): resolve incident {branch_name[:8]}"
             )
 
-            # Embed PAT into push URL if pushing over HTTPS
-            auth_remote = remote
-            if token and "github.com" in remote:
-                auth_remote = f"https://x-access-token:{token}@github.com/{target_repo or 'priyanshi-100506/aletheia'}.git"
-
+            # Push – embed token if needed for HTTPS
+            auth_remote = remote_url
+            if token and "github.com" in remote_url:
+                auth_remote = f"https://x-access-token:{token}@github.com/{api_repo}.git"
             await asyncio.to_thread(
                 _git, worktree, "push", auth_remote, f"{branch}:{branch}", token=token
             )
+            remote_branch_sha = await asyncio.to_thread(
+                _git, worktree, "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}", token=token
+            )
+            pushed_sha = remote_branch_sha.split()[0] if remote_branch_sha else ""
+            local_sha = await asyncio.to_thread(_git, worktree, "rev-parse", "HEAD")
+            if pushed_sha != local_sha:
+                raise RuntimeError("Remote branch SHA does not match the pushed commit")
+            pushed_commit_sha = local_sha
         except Exception as exc:
-            sanitized_msg = _sanitize_output(str(exc), token)
-            raise RuntimeError(sanitized_msg) from None
+            sanitized = _sanitize_output(str(exc), token)
+            raise RuntimeError(sanitized) from None
         finally:
             try:
                 await asyncio.to_thread(_git, str(repository_path), "worktree", "remove", "--force", worktree)
             except Exception:
                 pass
 
+    # Create PR via GitHub API
     async with httpx.AsyncClient(timeout=timeout) as client:
+        commit_response = await client.get(
+            f"https://api.github.com/repos/{api_repo}/commits/{pushed_commit_sha}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        )
+        if commit_response.status_code >= 400 or commit_response.json().get("sha") != pushed_commit_sha:
+            raise RuntimeError("GitHub did not verify the pushed commit")
         response = await client.post(
             url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
             json={"title": pr_title, "body": pr_body, "head": branch, "base": base_branch},
         )
         if response.status_code >= 400:
-            sanitized_resp = _sanitize_output(response.text, token)
-            raise RuntimeError(f"GitHub API Error {response.status_code}: {sanitized_resp}")
+            sanitized = _sanitize_output(response.text, token)
+            raise RuntimeError(f"GitHub API Error {response.status_code}: {sanitized}")
         data = response.json()
-    return {"pr_url": data["html_url"], "url": data["html_url"], "number": data.get("number"), "data": data}
+
+    # Verify PR exists via GET
+    pr_number = data.get("number")
+    if not pr_number:
+        raise RuntimeError("GitHub response missing PR number")
+    verify_url = f"{url}/{pr_number}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        verify_resp = await client.get(
+            verify_url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        )
+        if verify_resp.status_code >= 400:
+            sanitized = _sanitize_output(verify_resp.text, token)
+            raise RuntimeError(f"Failed to verify PR {pr_number}: {sanitized}")
+        verified_data = verify_resp.json()
+
+    verified_repo = _canonical_repo(verified_data.get("base", {}).get("repo", {}).get("full_name", ""))
+    verified_head = verified_data.get("head", {})
+    if (
+        verified_repo != incident_canonical
+        or verified_data.get("number") != pr_number
+        or not verified_data.get("html_url")
+        or verified_head.get("ref") != branch
+        or verified_head.get("sha") != pushed_commit_sha
+        or verified_data.get("base", {}).get("ref") != base_branch
+        or (base_sha and verified_data.get("base", {}).get("sha", "").lower() != base_sha.lower())
+    ):
+        raise RuntimeError("GitHub PR verification did not match the approved target and base")
+
+    return {
+        "pr_url": verified_data.get("html_url"),
+        "url": verified_data.get("html_url"),
+        "number": verified_data.get("number"),
+        "data": verified_data,
+    }

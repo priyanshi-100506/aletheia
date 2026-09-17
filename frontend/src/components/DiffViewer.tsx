@@ -46,6 +46,7 @@ export function DiffViewer({
   const lines = unifiedDiff.split('\n')
   const addedCount = lines.filter((l) => l.startsWith('+') && !l.startsWith('+++')).length
   const removedCount = lines.filter((l) => l.startsWith('-') && !l.startsWith('---')).length
+  const approvalReady = ['VALIDATION_PASSED', 'DRY_RUN_PASSED', 'WAIT_FOR_APPROVAL'].includes(status)
 
   return (
     <div style={{ border: '1px solid #DED4D9', borderRadius: '6px', overflow: 'hidden', background: '#24081F' }}>
@@ -206,14 +207,15 @@ export function DiffViewer({
             </button>
             <button
               onClick={onApprove}
-              disabled={isApproving}
+              disabled={isApproving || !approvalReady || status === 'PR_CREATED'}
               style={{
                 background: status === 'PR_CREATED' ? '#5B4F58' : '#0E6B5C',
                 color: '#FFFFFF',
                 border: 'none',
                 padding: '0.4rem 1rem',
                 borderRadius: '4px',
-                cursor: isApproving ? 'wait' : 'pointer',
+                cursor: isApproving ? 'wait' : approvalReady ? 'pointer' : 'not-allowed',
+                opacity: approvalReady || status === 'PR_CREATED' ? 1 : 0.5,
                 fontSize: '0.8rem',
                 fontWeight: 600,
                 display: 'flex',
@@ -221,7 +223,7 @@ export function DiffViewer({
                 gap: '0.4rem',
               }}
             >
-              {isApproving ? 'Pushing PR...' : status === 'PR_CREATED' ? 'PR Already Created' : 'Approve & Push PR'}
+              {isApproving ? 'Pushing PR...' : status === 'PR_CREATED' ? 'PR Already Created' : approvalReady ? 'Approve & Push PR' : 'Awaiting validation'}
             </button>
           </div>
         </div>

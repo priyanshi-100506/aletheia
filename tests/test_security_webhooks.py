@@ -185,6 +185,17 @@ def test_patcher_prompt_includes_line_numbers():
     assert "  1 | def foo():" in numbered_source
     assert "  2 |     return 42" in numbered_source
 
+def test_sanitize_diff_normalizes_header_paths():
+    """Verify sanitize_diff normalizes header paths missing a/ and b/ prefixes."""
+    from app.services.git_applier import sanitize_diff
 
-
-
+    raw_diff = (
+        "--- incident_demo/services/users.py\n"
+        "+++ incident_demo/services/users.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    clean = sanitize_diff(raw_diff)
+    assert "--- a/incident_demo/services/users.py\n" in clean
+    assert "+++ b/incident_demo/services/users.py\n" in clean

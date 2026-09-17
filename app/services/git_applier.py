@@ -24,6 +24,20 @@ def sanitize_diff(raw_diff: str) -> str:
         cleaned = "\n".join(lines)
 
     cleaned = cleaned.replace("\r\n", "\n")
+
+    # Normalize patch headers to ensure a/ and b/ prefixes exist for git apply
+    norm_lines = []
+    for line in cleaned.splitlines():
+        if line.startswith("--- ") and not line.startswith("--- a/") and not line.startswith("--- /dev/null"):
+            path = line[4:].strip()
+            norm_lines.append(f"--- a/{path}")
+        elif line.startswith("+++ ") and not line.startswith("+++ b/") and not line.startswith("+++ /dev/null"):
+            path = line[4:].strip()
+            norm_lines.append(f"+++ b/{path}")
+        else:
+            norm_lines.append(line)
+    cleaned = "\n".join(norm_lines)
+
     if not cleaned.endswith("\n"):
         cleaned += "\n"
     return cleaned

@@ -26,16 +26,35 @@ def _run(*args: str, cwd: str | None = None) -> None:
 
 @asynccontextmanager
 async def checked_out_target(repository: str, base_sha: str | None):
-    """Clone only the incident repository and pin it to its requested base SHA.
-
-    A checkout is deliberately short-lived: it cannot be confused with the
-    ALETHEIA application checkout and it is never reused for a later incident.
-    """
+    """Clone only the incident repository and pin it to its requested base SHA."""
     canonical = validate_incident_repository(repository)
     workspace = tempfile.mkdtemp(prefix="aletheia-target-")
     try:
         remote = f"https://github.com/{canonical}.git"
-        await asyncio.to_thread(_run, "clone", remote, workspace)
+        local_cache = Path(settings.REPO_PATH).resolve() / "aletheia-demo-bugs"
+        if not local_cache.exists() or not (local_cache / ".git").exists():
+            local_cache = Path(settings.REPO_PATH).resolve()
+
+        if local_cache.exists() and (local_cache / ".git").exists():
+            # Check if local cache is the right repo
+            cache_remote = subprocess.check_output(
+                ["git", "remote", "get-url", "origin"], cwd=local_cache, text=True
+            ).strip()
+            if _canonical_repo(cache_remote) == canonical:
+                await asyncio.to_thread(_run, "clone", str(local_cache), workspace)
+                await asyncio.to_thread(_run, "remote", "set-url", "origin", remote, cwd=workspace)
+
+        if not (Path(workspace) / ".git").exists():
+            # Fallback to network clone with retries
+            for attempt in range(3):
+                try:
+                    await asyncio.to_thread(_run, "clone", remote, workspace)
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1)
+
         await asyncio.to_thread(_run, "checkout", "--detach", base_sha or "HEAD", cwd=workspace)
         actual_remote = await asyncio.to_thread(
             subprocess.check_output, ["git", "remote", "get-url", "origin"], cwd=workspace, text=True
@@ -50,3 +69,4 @@ async def checked_out_target(repository: str, base_sha: str | None):
         yield Path(workspace)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+

@@ -75,7 +75,8 @@ async def create_pull_request(
     3. POST to GitHub to create the PR.
     4. GET the PR to verify its existence.
     """
-    repository_path = _repository_path(repo_path)
+    repository_path = _repository_path(repo_path, allow_external=True)
+
     branch = branch_name if branch_name.startswith("fix/aletheia-") else f"fix/aletheia-{branch_name}"
     if len(patch_diff) > settings.MAX_PATCH_LENGTH:
         raise ValueError("Patch exceeds the maximum allowed size")
@@ -163,17 +164,37 @@ async def create_pull_request(
             auth_remote = remote_url
             if token and "github.com" in remote_url:
                 auth_remote = f"https://x-access-token:{token}@github.com/{api_repo}.git"
-            await asyncio.to_thread(
-                _git, worktree, "push", auth_remote, f"{branch}:{branch}", token=token
-            )
-            remote_branch_sha = await asyncio.to_thread(
-                _git, worktree, "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}", token=token
-            )
+
+            for push_attempt in range(5):
+                try:
+                    await asyncio.to_thread(
+                        _git, worktree, "push", auth_remote, f"{branch}:{branch}", token=token
+                    )
+                    break
+                except Exception as push_err:
+                    if push_attempt == 4:
+                        raise
+                    logger.warning("git push failed (attempt %d/5): %s", push_attempt + 1, push_err)
+                    await asyncio.sleep(2 * (push_attempt + 1))
+
+            remote_branch_sha = ""
+            for ls_attempt in range(5):
+                try:
+                    remote_branch_sha = await asyncio.to_thread(
+                        _git, worktree, "ls-remote", "--exit-code", auth_remote, f"refs/heads/{branch}", token=token
+                    )
+                    break
+                except Exception as ls_err:
+                    if ls_attempt == 4:
+                        raise
+                    await asyncio.sleep(2 * (ls_attempt + 1))
+
             pushed_sha = remote_branch_sha.split()[0] if remote_branch_sha else ""
             local_sha = await asyncio.to_thread(_git, worktree, "rev-parse", "HEAD")
             if pushed_sha != local_sha:
                 raise RuntimeError("Remote branch SHA does not match the pushed commit")
             pushed_commit_sha = local_sha
+
         except Exception as exc:
             sanitized = _sanitize_output(str(exc), token)
             raise RuntimeError(sanitized) from None

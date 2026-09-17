@@ -176,12 +176,13 @@ def test_checked_out_target_materializes_base_sha(tmp_path, monkeypatch):
     asyncio.run(run_test())
 
 
-def test_patcher_system_instruction_demands_strict_diff_hunks():
-    """Verify system instruction contains strict requirements for diff headers and context lines."""
+def test_patcher_system_instruction_demands_strict_proposal():
+    """Verify system instruction contains strict requirements for proposal generation."""
     from app.services.patcher import SYSTEM_INSTRUCTION
 
-    assert "CRITICAL UNIFIED DIFF REQUIREMENTS" in SYSTEM_INSTRUCTION
-    assert "--- a/<target_file_path>" in SYSTEM_INSTRUCTION
+    assert "CRITICAL PROPOSAL REQUIREMENTS" in SYSTEM_INSTRUCTION
+    assert "original_code" in SYSTEM_INSTRUCTION
+
 
 def test_sanitize_diff_normalizes_header_paths():
     """Verify sanitize_diff normalizes header paths missing a/ and b/ prefixes."""

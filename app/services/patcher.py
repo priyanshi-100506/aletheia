@@ -15,6 +15,7 @@ Database contract:
     session until after this function returns.
 """
 import asyncio
+import difflib
 import logging
 import os
 import uuid
@@ -32,7 +33,7 @@ from tenacity import (
 
 from app.config import settings
 from app.models.remediation import PatchStatus, RemediationJob
-from app.schemas.patch import PatchResult
+from app.schemas.patch import PatchProposal, PatchResult
 
 logger = logging.getLogger("aletheia")
 
@@ -90,26 +91,91 @@ def _safe_read_target_file(target_file: str, repo_root: str | None = None) -> st
         logger.warning("Could not read target file %s: %s", target_file, exc)
         return None
 
+
+def construct_deterministic_patch(
+    source_content: str,
+    target_file: str,
+    original_code: str,
+    replacement_code: str,
+) -> str:
+    """Construct a deterministic unified diff by replacing original_code with replacement_code in source_content.
+
+    Validation rules:
+    1. original_code must exist in source_content.
+    2. original_code must match unambiguously (exact 1 occurrence).
+    3. Returns unified diff formatted with standard a/ and b/ headers and trailing newline.
+    """
+    if not original_code:
+        raise ValueError("Original code snippet proposed by model cannot be empty")
+
+    norm_source = source_content.replace("\r\n", "\n")
+    norm_orig = original_code.replace("\r\n", "\n")
+    norm_repl = replacement_code.replace("\r\n", "\n")
+
+    count = norm_source.count(norm_orig)
+    if count == 0:
+        raise ValueError(
+            f"Original code region proposed for '{target_file}' was not found in the target source file."
+        )
+    if count > 1:
+        raise ValueError(
+            f"Original code region proposed for '{target_file}' is ambiguous (matches {count} times)."
+        )
+
+    modified_content = norm_source.replace(norm_orig, norm_repl, 1)
+
+    clean_target = target_file.lstrip("./")
+    from_file = f"a/{clean_target}"
+    to_file = f"b/{clean_target}"
+
+    source_lines = norm_source.splitlines(keepends=True)
+    modified_lines = modified_content.splitlines(keepends=True)
+
+    if source_lines and not source_lines[-1].endswith("\n"):
+        source_lines[-1] += "\n"
+    if modified_lines and not modified_lines[-1].endswith("\n"):
+        modified_lines[-1] += "\n"
+
+    diff_lines = list(
+        difflib.unified_diff(
+            source_lines,
+            modified_lines,
+            fromfile=from_file,
+            tofile=to_file,
+            n=3,
+        )
+    )
+
+    if not diff_lines:
+        raise ValueError(f"No changes produced for '{target_file}' (original and replacement are identical).")
+
+    unified_diff = "".join(diff_lines)
+    if not unified_diff.endswith("\n"):
+        unified_diff += "\n"
+
+    return unified_diff
+
+
 SYSTEM_INSTRUCTION = (
     "You are ALETHEIA, an autonomous AIOps software engineer. "
-    "Analyze the provided error log and target source code to generate a precise unified diff patch "
-    "that fixes the root cause.\n\n"
-    "CRITICAL UNIFIED DIFF REQUIREMENTS:\n"
-    "1. File header paths MUST use exact target file path with standard prefixes: `--- a/<target_file_path>` and `+++ b/<target_file_path>`.\n"
-    "2. Include 3 lines of unchanged context above and below modifications.\n"
-    "3. Context lines (starting with ' ') and deleted lines (starting with '-') MUST match the source code character for character.\n"
-    "4. Hunk header `@@ -start,count +start,count @@` MUST have correct line numbers and count totals.\n"
+    "Analyze the provided error log and target source code to identify the root cause and propose a precise code fix.\n\n"
+    "CRITICAL PROPOSAL REQUIREMENTS:\n"
+    "1. `file_path`: MUST be the exact target file path provided in context.\n"
+    "2. `original_code`: MUST be the exact snippet of original code from the target file that needs to be replaced. Include enough surrounding context if needed to ensure it matches uniquely in the file.\n"
+    "3. `replacement_code`: MUST be the exact new code snippet to replace `original_code`.\n"
+    "4. Do NOT output unified diffs or calculate line numbers manually.\n"
     "5. Output ONLY valid JSON matching the requested schema."
 )
 
 
-def _demo_patch(error_log: str, target_file: str | None) -> PatchResult:
+def _demo_patch(error_log: str, target_file: str | None, safe_source: str | None = None) -> PatchResult:
     if target_file in ("incident_demo/services/users.py", "incident-demo/services/users.py", "users.py"):
-        return PatchResult(
-            file_path="incident_demo/services/users.py",
-            bug_description="Requests for users without a configured display name fail with AttributeError when calling upper() on None.",
-            explanation="Check if display_name is not None before calling .upper(), defaulting to a fallback string or None.",
-            unified_diff=(
+        orig = "    return user.display_name.strip()\n"
+        repl = "    if user.display_name is None:\n        return user.username\n    return user.display_name.strip()\n"
+        if safe_source:
+            diff = construct_deterministic_patch(safe_source, target_file, orig, repl)
+        else:
+            diff = (
                 "--- a/incident_demo/services/users.py\n"
                 "+++ b/incident_demo/services/users.py\n"
                 "@@ -11,4 +11,6 @@\n"
@@ -120,15 +186,23 @@ def _demo_patch(error_log: str, target_file: str | None) -> PatchResult:
                 "+    if user.display_name is None:\n"
                 "+        return user.username\n"
                 "+    return user.display_name.strip()\n"
-            ),
+            )
+        return PatchResult(
+            file_path="incident_demo/services/users.py",
+            bug_description="Requests for users without a configured display name fail with AttributeError when calling upper() on None.",
+            explanation="Check if display_name is not None before calling .upper(), defaulting to a fallback string or None.",
+            unified_diff=diff,
             confidence_score=0.99,
+            original_code=orig,
+            replacement_code=repl,
         )
     if target_file == "transaction_service.py":
-        return PatchResult(
-            file_path=target_file,
-            bug_description="A missing discount tier can cause a NoneType or division error during fee calculation.",
-            explanation="Return the base fee when the discount tier is missing or zero before dividing.",
-            unified_diff=(
+        orig = "    return fee / discount_tier\n"
+        repl = "    if not discount_tier:\n        return fee\n    return fee / discount_tier\n"
+        if safe_source:
+            diff = construct_deterministic_patch(safe_source, target_file, orig, repl)
+        else:
+            diff = (
                 "--- a/transaction_service.py\n"
                 "+++ b/transaction_service.py\n"
                 "@@ -1,3 +1,5 @@\n"
@@ -138,8 +212,15 @@ def _demo_patch(error_log: str, target_file: str | None) -> PatchResult:
                 "+    if not discount_tier:\n"
                 "+        return fee\n"
                 "+    return fee / discount_tier\n"
-            ),
+            )
+        return PatchResult(
+            file_path=target_file,
+            bug_description="A missing discount tier can cause a NoneType or division error during fee calculation.",
+            explanation="Return the base fee when the discount tier is missing or zero before dividing.",
+            unified_diff=diff,
             confidence_score=0.98,
+            original_code=orig,
+            replacement_code=repl,
         )
     raise ValueError(
         f"No deterministic demo fixture exists for {target_file or 'the requested target'}. "
@@ -150,16 +231,18 @@ def _demo_patch(error_log: str, target_file: str | None) -> PatchResult:
 def _is_transient_error(exc: Exception) -> bool:
     """Return True for API errors that are worth retrying."""
     msg = str(exc)
-    return any(code in msg for code in ("503", "500", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+    return any(code in msg for code in ("503", "500", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "getaddrinfo", "11002", "ConnectError", "TimeoutError", "socket"))
+
 
 
 @retry(
     retry=retry_if_exception(_is_transient_error),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    stop=stop_after_attempt(8),
     reraise=True,
 )
-def _call_gemini_sync(client: genai.Client, model_name: str, prompt: str) -> PatchResult:
+
+def _call_gemini_sync(client: genai.Client, model_name: str, prompt: str) -> PatchProposal:
     """Synchronous Gemini API call, wrapped with tenacity retry logic.
 
     This is intentionally synchronous because `tenacity` has no native
@@ -173,11 +256,11 @@ def _call_gemini_sync(client: genai.Client, model_name: str, prompt: str) -> Pat
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
-            response_schema=PatchResult,
+            response_schema=PatchProposal,
             temperature=0.1,
         ),
     )
-    return PatchResult.model_validate_json(response.text)
+    return PatchProposal.model_validate_json(response.text)
 
 
 async def generate_patch(
@@ -186,34 +269,23 @@ async def generate_patch(
     target_file: str | None = None,
     job_id: str | None = None,
     repo_root: str | None = None,
+    target_test: str | None = None,
 ) -> tuple[PatchResult, RemediationJob]:
-    """Generate a patch for the given error log using Gemini AI.
+    """Generate a patch for the given error log using Gemini AI."""
+    if not target_file:
+        raise ValueError("target_file is required to generate a patch")
 
-    Creates or updates a `RemediationJob` record in the database, then
-    calls the Gemini API to produce a `PatchResult`. On success, updates
-    the job with the generated patch fields and sets status to GENERATED.
+    safe_source = _safe_read_target_file(target_file, repo_root)
 
-    Args:
-        db:          Open SQLAlchemy async session. Caller owns the lifecycle.
-        error_log:   Raw alert/error log text.
-        target_file: Optional path hint for the file to patch.
-        job_id:      If provided, update the existing job row; otherwise create one.
-
-    Returns:
-        Tuple of (PatchResult, RemediationJob).
-
-    Raises:
-        ValueError: If GEMINI_API_KEY is not set.
-        Exception:  Any non-retried Gemini API or validation error.
-    """
     if settings.DEMO_MODE:
-        patch_data = _demo_patch(error_log, target_file)
+        patch_data = _demo_patch(error_log, target_file, safe_source=safe_source)
         job = await db.get(RemediationJob, job_id) if job_id else None
         if job is None:
             job = RemediationJob(
                 id=job_id or str(uuid.uuid4()),
                 error_log=error_log,
                 target_file=target_file,
+                target_test=target_test,
                 status=PatchStatus.PENDING,
             )
             db.add(job)
@@ -227,7 +299,12 @@ async def generate_patch(
         await db.refresh(job)
         return patch_data, job
 
-    api_key = os.getenv("GEMINI_API_KEY", "")
+    if safe_source is None:
+        raise ValueError(
+            f"Target file '{target_file}' could not be read from repository checkout"
+        )
+
+    api_key = os.getenv("GEMINI_API_KEY", "") or settings.GEMINI_API_KEY
     if not api_key:
         raise ValueError(
             "GEMINI_API_KEY environment variable is not set. "
@@ -246,6 +323,7 @@ async def generate_patch(
             id=job_id or str(uuid.uuid4()),
             error_log=error_log,
             target_file=target_file,
+            target_test=target_test,
             status=PatchStatus.PENDING,
         )
         db.add(job)
@@ -253,40 +331,89 @@ async def generate_patch(
         job.error_log = error_log
         if target_file:
             job.target_file = target_file
+        if target_test:
+            job.target_test = target_test
 
     await db.commit()
     await db.refresh(job)
 
-    # ── Build prompt safely ───────────────────────────────────────────────────
-    safe_source: str | None = None
-    if target_file:
-        safe_source = _safe_read_target_file(target_file, repo_root)
+    # Fetch target_test from job if not passed directly
+    if not target_test and job.target_test:
+        target_test = job.target_test
 
+    # ── Build prompt ──────────────────────────────────────────────────────────
     prompt_parts = [
-        "Analyze the following incident report and produce a precise unified diff patch.\n\n",
-        f"<error_log>\n{error_log}\n</error_log>\n",
+        "Analyze the following incident report and target source file. ",
+        "Identify the root cause and propose a code change.\n\n",
+        f"<error_log>\n{error_log}\n</error_log>\n\n",
+        f'<target_file path="{target_file}">\n{safe_source}\n</target_file>\n',
     ]
-    if target_file:
-        if safe_source is not None:
+
+    if target_test:
+        test_file_path = target_test.split("::")[0]
+        safe_test_source = _safe_read_target_file(test_file_path, repo_root)
+        if safe_test_source:
             prompt_parts.append(
-                f"\n<target_file path=\"{target_file}\">\n{safe_source}\n</target_file>\n"
+                f'\n<target_test_file path="{test_file_path}">\n{safe_test_source}\n</target_test_file>\n'
             )
-        else:
-            prompt_parts.append(f"\n<target_file_hint>{target_file}</target_file_hint>\n")
 
     prompt = "".join(prompt_parts)
 
-    # ── Call Gemini (in thread to keep event loop free) ───────────────────────
+
+    # ── Call Gemini ───────────────────────────────────────────────────────────
     client = genai.Client(api_key=api_key)
     try:
-        patch_data: PatchResult = await asyncio.to_thread(
+        proposal: PatchProposal = await asyncio.to_thread(
             _call_gemini_sync, client, model_name, prompt
         )
-    except Exception:
+    except Exception as exc:
         job.status = PatchStatus.FAILED
-        job.error_message = "Gemini API call failed after retries"
+        job.error_message = f"Gemini API call failed: {exc}"
         await db.commit()
         raise
+
+    # ── Validate proposed target path ─────────────────────────────────────────
+    clean_target = target_file.lstrip("./")
+    clean_prop_path = proposal.file_path.lstrip("./")
+    if clean_prop_path != clean_target and not clean_target.endswith(clean_prop_path):
+        error_msg = f"Proposal file path '{proposal.file_path}' does not match target file '{target_file}'"
+        job.status = PatchStatus.FAILED
+        job.error_message = error_msg
+        await db.commit()
+        raise ValueError(error_msg)
+
+    # Ensure the proposal includes required code snippets
+    if not proposal.original_code or not proposal.replacement_code:
+        error_msg = "PatchProposal missing original_code or replacement_code; cannot construct deterministic diff."
+        job.status = PatchStatus.FAILED
+        job.error_message = error_msg
+        await db.commit()
+        raise ValueError(error_msg)
+
+    # ── Deterministically construct unified diff ──────────────────────────────
+    try:
+        unified_diff = construct_deterministic_patch(
+            source_content=safe_source,
+            target_file=target_file,
+            original_code=proposal.original_code,
+            replacement_code=proposal.replacement_code,
+        )
+    except Exception as exc:
+        error_msg = f"Patch construction failed: {exc}"
+        job.status = PatchStatus.FAILED
+        job.error_message = error_msg
+        await db.commit()
+        raise ValueError(error_msg) from exc
+
+    patch_data = PatchResult(
+        file_path=target_file,
+        bug_description=proposal.bug_description,
+        explanation=proposal.explanation,
+        unified_diff=unified_diff,
+        confidence_score=proposal.confidence_score,
+        original_code=proposal.original_code,
+        replacement_code=proposal.replacement_code,
+    )
 
     # ── Persist patch result ──────────────────────────────────────────────────
     job.target_file = patch_data.file_path
@@ -299,3 +426,4 @@ async def generate_patch(
     await db.refresh(job)
 
     return patch_data, job
+

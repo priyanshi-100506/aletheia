@@ -25,12 +25,9 @@ logger = logging.getLogger("aletheia")
 
 
 def _normalise_database_url(url: str) -> str:
-    """Convert a Neon/standard postgres URL to asyncpg-compatible format.
-
-    Handles two common mismatches:
-    1. Plain `postgresql://` → `postgresql+asyncpg://`
-    2. `sslmode=require`    → `ssl=require` (asyncpg parameter name)
-    """
+    """Convert standard postgres or sqlite URLs to async-compatible format."""
+    if url.startswith("sqlite://") and "+aiosqlite" not in url:
+        return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
     if url.startswith("postgresql://") and "+asyncpg" not in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     if url.startswith("postgres://") and "+asyncpg" not in url:
@@ -43,20 +40,20 @@ def _normalise_database_url(url: str) -> str:
 DATABASE_URL: str = _normalise_database_url(
     os.getenv(
         "DATABASE_URL",
-        "postgresql+asyncpg://aletheia_user:aletheia_password@localhost:5435/aletheia_db",
+        "sqlite+aiosqlite:///./aletheia_dev.db",
     )
 )
 
-# Connection pool settings tuned for a medium-load async API.
-# pool_size=10 keeps 10 persistent connections open.
-# max_overflow=20 allows up to 30 total under burst.
+is_sqlite = DATABASE_URL.startswith("sqlite")
+engine_kwargs = {"echo": False}
+if not is_sqlite:
+    engine_kwargs.update({"pool_size": 10, "max_overflow": 20, "pool_pre_ping": True})
+
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,  # Verify connection health before each use
+    **engine_kwargs
 )
+
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

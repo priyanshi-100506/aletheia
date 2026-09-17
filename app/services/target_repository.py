@@ -35,7 +35,7 @@ async def checked_out_target(repository: str, base_sha: str | None):
     workspace = tempfile.mkdtemp(prefix="aletheia-target-")
     try:
         remote = f"https://github.com/{canonical}.git"
-        await asyncio.to_thread(_run, "clone", "--no-checkout", remote, workspace)
+        await asyncio.to_thread(_run, "clone", remote, workspace)
         await asyncio.to_thread(_run, "checkout", "--detach", base_sha or "HEAD", cwd=workspace)
         actual_remote = await asyncio.to_thread(
             subprocess.check_output, ["git", "remote", "get-url", "origin"], cwd=workspace, text=True

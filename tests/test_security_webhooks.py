@@ -123,3 +123,57 @@ def test_patch_rejects_unexpected_target_file():
         assert "outside" in str(exc)
     else:
         raise AssertionError("unexpected patch target was accepted")
+
+
+def test_checked_out_target_materializes_base_sha(tmp_path, monkeypatch):
+    """Test checked_out_target materializes base_sha in isolated temporary checkout."""
+    import asyncio
+    import subprocess
+    from app.services import target_repository
+    from app.services.target_repository import checked_out_target, _canonical_repo
+
+    # Create local source git repository
+    src_dir = tmp_path / "src_repo"
+    src_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=src_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=src_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_dir, check=True)
+
+    # Initial commit
+    file1 = src_dir / "test.txt"
+    file1.write_text("v1")
+    subprocess.run(["git", "add", "test.txt"], cwd=src_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "commit 1"], cwd=src_dir, check=True)
+    sha1 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src_dir, text=True).strip()
+
+    # Second commit
+    file1.write_text("v2")
+    subprocess.run(["git", "commit", "-am", "commit 2"], cwd=src_dir, check=True)
+    sha2 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src_dir, text=True).strip()
+
+    from app.config import settings
+    monkeypatch.setattr(settings, "ALLOWED_REPOS", [str(src_dir)])
+    monkeypatch.setattr("app.services.target_repository._canonical_repo", lambda r: str(src_dir) if "src_repo" in r else _canonical_repo(r))
+
+    async def run_test():
+        monkeypatch.setattr("app.services.target_repository.validate_incident_repository", lambda r: str(src_dir))
+
+        orig_run = target_repository._run
+
+        def mock_run(*args, cwd=None):
+            cmd = list(args)
+            if cmd[0] == "clone":
+                cmd[1] = str(src_dir)  # replace f"https://github.com/{canonical}.git" with local path
+            return orig_run(*cmd, cwd=cwd)
+
+        monkeypatch.setattr("app.services.target_repository._run", mock_run)
+
+        async with checked_out_target(str(src_dir), sha1) as checkout_dir:
+            assert (checkout_dir / "test.txt").read_text() == "v1"
+            curr_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout_dir, text=True).strip()
+            assert curr_sha == sha1
+
+    asyncio.run(run_test())
+
+
+
